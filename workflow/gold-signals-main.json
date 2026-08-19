@@ -1,0 +1,412 @@
+{
+  "name": "Gold signals — XAU/USD 30min",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 * * * 1-4"
+            },
+            {
+              "field": "cronExpression",
+              "expression": "*/30 0-21 * * 5"
+            },
+            {
+              "field": "cronExpression",
+              "expression": "*/30 21-23 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -200,
+        300
+      ],
+      "notes": "Weekends are not scheduled at all, so no execution is spent while the market is shut. ~1,050 executions/month."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * NODE 1/5 — Build fetch plan\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Emits one item per (symbol, interval). The HTTP Request node downstream runs\n * once per item automatically, so N series cost N calls but still ONE n8n\n * execution. That is the whole reason this is a fan-out array and not a set of\n * sub-workflows.\n *\n * >>> EXTENSION SEAM <<<\n * To add an asset, add an entry to ASSETS. Nothing else in the workflow\n * changes. Check the budget first:\n *\n *   calls/day = (3 x assets + 1) x runs/day    (~48 runs/day)\n *\n *   1 asset  ->  192/day   24% of Twelve Data free tier (800/day)\n *   2 assets ->  336/day   42%\n *   3 assets ->  480/day   60%\n *   5 assets ->  768/day   96%  <- ceiling\n *   6 assets ->  912/day   exceeds free tier, needs a paid plan\n *\n * n8n executions do NOT change with asset count. The data API is the\n * binding constraint.\n * ==========================================================================*/\n\n/* >>> LANGUAGE <<<\n * One setting, read by the Scorer (setup notes), Format message (all labels and\n * the disclaimer) and the LLM prompt (which language to write prose in).\n * Supported: 'ru', 'en'. Change it here only — nothing else needs editing.\n *\n * Prices stay in 1,234.56 format in every language. Trading channels use that\n * convention regardless of locale, and it keeps the LLM's decimal separator\n * consistent with the signal block (see the note in 05-format.js about why a\n * Russian-style comma decimal would trip the number validator).\n */\nconst LANG = 'ru';\n\nconst ASSETS = [\n  {\n    symbol: 'XAU/USD',\n    label: { ru: 'ЗОЛОТО', en: 'GOLD' },\n    emoji: '\\u{1F7E1}', // yellow circle\n    series: [\n      { interval: '15min', outputsize: 100 }, // entry timing, compression\n      { interval: '1h', outputsize: 200 },    // EMA 200 needs 200 bars\n      { interval: '1day', outputsize: 60 },   // prior-day levels, daily ATR\n    ],\n  },\n];\n\n// Shared context series. Fetched once and reused by every asset, so adding a\n// second asset costs 3 calls, not 4.\nconst CONTEXT = [\n  {\n    symbol: 'EUR/USD',\n    interval: '1h',\n    outputsize: 20,\n    role: 'dollar_proxy',\n  },\n];\n\nconst plan = [];\n\nfor (const asset of ASSETS) {\n  for (const s of asset.series) {\n    plan.push({\n      json: {\n        role: 'asset',\n        symbol: asset.symbol,\n        interval: s.interval,\n        outputsize: s.outputsize,\n        // Resolve the display name for the active language, falling back to the\n        // raw value so a plain string still works if someone edits ASSETS.\n        label:\n          typeof asset.label === 'string'\n            ? asset.label\n            : asset.label[LANG] || asset.label.en,\n        emoji: asset.emoji,\n        lang: LANG,\n      },\n      // 1:N fan-out — without pairedItem, downstream nodes that expect item\n      // lineage fail with paired_item_no_info.\n      pairedItem: { item: 0 },\n    });\n  }\n}\n\nfor (const c of CONTEXT) {\n  plan.push({\n    json: {\n      role: c.role,\n      symbol: c.symbol,\n      interval: c.interval,\n      outputsize: c.outputsize,\n      label: null,\n      emoji: null,\n      lang: LANG,\n    },\n    pairedItem: { item: 0 },\n  });\n}\n\n// Fail loudly rather than posting a message built from nothing.\nif (plan.length === 0) {\n  throw new Error('Fetch plan is empty — check the ASSETS config array.');\n}\n\nreturn plan;\n"
+      },
+      "id": "code-01",
+      "name": "Build fetch plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        300
+      ],
+      "notes": "EXTENSION SEAM: add an asset here. 5 assets max on the Twelve Data free tier.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "url": "https://api.twelvedata.com/time_series",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $json.symbol }}"
+            },
+            {
+              "name": "interval",
+              "value": "={{ $json.interval }}"
+            },
+            {
+              "name": "outputsize",
+              "value": "={{ $json.outputsize }}"
+            },
+            {
+              "name": "timezone",
+              "value": "UTC"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "http-twelvedata",
+      "name": "Fetch series",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Runs once per item from the fetch plan. API key lives in a Query Auth credential (name=apikey), never in this JSON.",
+      "credentials": {
+        "httpQueryAuth": {
+          "name": "Twelve Data apikey"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * NODE 2/5 — Indicators\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Turns raw Twelve Data responses into the indicator set the scorer consumes.\n * Nothing here makes a decision; it only measures.\n *\n * TWELVE DATA RESPONSE NOTES (these bite if forgotten):\n *   - `values` is NEWEST-FIRST. Everything below reverses to oldest-first\n *     immediately and works chronologically thereafter.\n *   - Every OHLC field is a STRING. parseFloat everywhere.\n *   - No `volume` for metals/forex. Do not depend on it.\n *   - Errors come back HTTP 200 with {status:\"error\", code, message}.\n *   - Responses are matched to the fetch plan by meta.symbol + meta.interval,\n *     not by item order. Order is not contractual.\n *\n * STALENESS GATE: if the newest 15m bar is older than 60 minutes the market is\n * shut (weekend, holiday, or the DST-straddling hour the cron over-covers).\n * We return [] which ends the run with no post. That is correct behaviour,\n * not a failure.\n * ==========================================================================*/\n\nconst MAX_BAR_AGE_MIN = 60;\n\n// ---------------------------------------------------------------- helpers ---\n\n/** Wilder EMA. Seeds from the SMA of the first `period` values. */\nfunction ema(values, period) {\n  if (!Array.isArray(values) || values.length < period) return null;\n  const k = 2 / (period + 1);\n  let acc = 0;\n  for (let i = 0; i < period; i++) acc += values[i];\n  let e = acc / period;\n  for (let i = period; i < values.length; i++) {\n    e = values[i] * k + e * (1 - k);\n  }\n  return e;\n}\n\n/** Wilder ATR. bars are oldest-first {high, low, close}. */\nfunction atr(bars, period) {\n  if (!Array.isArray(bars) || bars.length < period + 1) return null;\n  const tr = [];\n  for (let i = 1; i < bars.length; i++) {\n    const prevClose = bars[i - 1].close;\n    tr.push(\n      Math.max(\n        bars[i].high - bars[i].low,\n        Math.abs(bars[i].high - prevClose),\n        Math.abs(bars[i].low - prevClose),\n      ),\n    );\n  }\n  let acc = 0;\n  for (let i = 0; i < period; i++) acc += tr[i];\n  let a = acc / period;\n  for (let i = period; i < tr.length; i++) {\n    a = (a * (period - 1) + tr[i]) / period;\n  }\n  return a;\n}\n\nfunction highest(bars, n, key) {\n  const slice = bars.slice(-n);\n  return slice.reduce((m, b) => (b[key] > m ? b[key] : m), -Infinity);\n}\n\nfunction lowest(bars, n, key) {\n  const slice = bars.slice(-n);\n  return slice.reduce((m, b) => (b[key] < m ? b[key] : m), Infinity);\n}\n\nfunction round(n, dp) {\n  if (n === null || n === undefined || !Number.isFinite(n)) return null;\n  const f = Math.pow(10, dp);\n  return Math.round(n * f) / f;\n}\n\n/**\n * Twelve Data intraday datetime is \"YYYY-MM-DD HH:mm:ss\" with no zone marker.\n * We request timezone=UTC on the HTTP node, so append Z to parse it as UTC\n * rather than letting the runtime guess local time.\n */\nfunction parseBarTime(dt) {\n  if (!dt) return null;\n  const iso = dt.length <= 10 ? `${dt}T00:00:00Z` : `${dt.replace(' ', 'T')}Z`;\n  const ms = Date.parse(iso);\n  return Number.isFinite(ms) ? ms : null;\n}\n\n/** Normalise one Twelve Data response into oldest-first numeric bars. */\nfunction toBars(body) {\n  return body.values\n    .map((v) => ({\n      t: parseBarTime(v.datetime),\n      datetime: v.datetime,\n      open: parseFloat(v.open),\n      high: parseFloat(v.high),\n      low: parseFloat(v.low),\n      close: parseFloat(v.close),\n    }))\n    .filter(\n      (b) =>\n        b.t !== null &&\n        Number.isFinite(b.open) &&\n        Number.isFinite(b.high) &&\n        Number.isFinite(b.low) &&\n        Number.isFinite(b.close),\n    )\n    .sort((a, b) => a.t - b.t); // oldest-first, explicitly — do not trust order\n}\n\nfunction sessionForHour(h) {\n  if (h < 7) return 'asia';\n  if (h < 13) return 'london';\n  if (h < 17) return 'ny_overlap';\n  if (h < 21) return 'ny_afternoon';\n  return 'late';\n}\n\n// --------------------------------------------------- collect the responses ---\n\nconst responses = $input.all();\nconst plan = $('Build fetch plan').all().map((i) => i.json);\n\n// Keyed \"SYMBOL|interval\" -> bars\nconst series = {};\n\nfor (const item of responses) {\n  const body = item.json || {};\n\n  if (body.status !== 'ok' || !Array.isArray(body.values)) {\n    // Surfaces as a workflow error -> error workflow DMs the owner.\n    // Common causes: exhausted API credits (429), bad symbol, expired key.\n    const detail = body.message || JSON.stringify(body).slice(0, 300);\n    throw new Error(`Twelve Data request failed: ${detail}`);\n  }\n\n  const sym = body.meta && body.meta.symbol;\n  const ivl = body.meta && body.meta.interval;\n  if (!sym || !ivl) {\n    throw new Error('Twelve Data response missing meta.symbol / meta.interval');\n  }\n\n  const bars = toBars(body);\n  if (bars.length === 0) {\n    throw new Error(`Twelve Data returned no usable bars for ${sym} ${ivl}`);\n  }\n  series[`${sym}|${ivl}`] = bars;\n}\n\n// Display metadata lives in the fetch plan so config stays in exactly one node.\nconst assetCfg = plan.find((p) => p.role === 'asset');\nif (!assetCfg) throw new Error('No asset row found in the fetch plan.');\n\nconst SYM = assetCfg.symbol;\nconst m15 = series[`${SYM}|15min`];\nconst h1 = series[`${SYM}|1h`];\nconst d1 = series[`${SYM}|1day`];\n\nconst dollarCfg = plan.find((p) => p.role === 'dollar_proxy');\nconst fx = dollarCfg ? series[`${dollarCfg.symbol}|${dollarCfg.interval}`] : null;\n\nfor (const [name, arr] of [['15min', m15], ['1h', h1], ['1day', d1]]) {\n  if (!arr) throw new Error(`Missing ${SYM} ${name} series in responses.`);\n}\n\n// -------------------------------------------------------- staleness gate ----\n\nconst nowMs = Date.now();\nconst newest15 = m15[m15.length - 1];\nconst barAgeMin = (nowMs - newest15.t) / 60000;\n\nif (barAgeMin > MAX_BAR_AGE_MIN) {\n  const sd = $getWorkflowStaticData('global');\n  sd.skipped = (sd.skipped || 0) + 1;\n  sd.lastSkipAt = new Date(nowMs).toISOString();\n  console.log(\n    `Market closed or data stale: newest 15m bar is ${Math.round(barAgeMin)} min old. Skipping run.`,\n  );\n  return []; // ends the run, posts nothing\n}\n\n// ------------------------------------------------------------ indicators ----\n\nconst price = newest15.close;\nconst closes1h = h1.map((b) => b.close);\n\nconst ema20 = ema(closes1h, 20);\nconst ema50 = ema(closes1h, 50);\nconst ema200 = ema(closes1h, 200); // null if fewer than 200 bars returned\nconst atr1h = atr(h1, 14);\nconst atrDaily = atr(d1, 14);\n\nif (!Number.isFinite(atr1h) || atr1h <= 0) {\n  throw new Error('ATR(1h) could not be computed — insufficient 1h history.');\n}\n\n// Prior completed daily bar. values[0] after sorting is oldest, so the newest\n// daily bar is last — and it may be today's still-forming bar.\nconst todayUTC = new Date(nowMs).toISOString().slice(0, 10);\nconst newestDaily = d1[d1.length - 1];\nconst priorDay =\n  newestDaily.datetime.slice(0, 10) === todayUTC && d1.length >= 2\n    ? d1[d1.length - 2]\n    : newestDaily;\n\n// EMA stack: +1 aligned up, -1 aligned down, 0 mixed/unknown.\nlet emaStack = 0;\nif (ema20 !== null && ema50 !== null && ema200 !== null) {\n  if (ema20 > ema50 && ema50 > ema200) emaStack = 1;\n  else if (ema20 < ema50 && ema50 < ema200) emaStack = -1;\n}\n\n// Daily trend, independent of the 1h stack. Used for the conflict penalty.\nconst dailyCloses = d1.map((b) => b.close);\nconst dailyEma20 = ema(dailyCloses, 20);\nlet dailyTrend = 0;\nif (dailyEma20 !== null) {\n  if (price > dailyEma20 * 1.001) dailyTrend = 1;\n  else if (price < dailyEma20 * 0.999) dailyTrend = -1;\n}\n\n// Compression: 8-bar 15m range relative to 1h ATR. < 0.6 is a squeeze.\n// The bounds are exported too — range_squeeze publishes them as the levels to\n// watch, since it has no directional bias of its own.\nconst range8High = highest(m15, 8, 'high');\nconst range8Low = lowest(m15, 8, 'low');\nconst range8 = range8High - range8Low;\nconst compressionRatio = range8 / atr1h;\n\n// 24h change. 96 x 15m bars = 24h; fall back to prior-day close if short.\nconst idx24h = m15.length - 1 - 96;\nconst ref24h = idx24h >= 0 ? m15[idx24h].close : priorDay.close;\nconst change24hPct = ((price - ref24h) / ref24h) * 100;\n\n// 1h swing structure over the last 20 bars.\nconst swingHigh = highest(h1, 20, 'high');\nconst swingLow = lowest(h1, 20, 'low');\n\n// 5-day range position, 0 (at lows) .. 1 (at highs).\nconst hi5 = highest(d1, 5, 'high');\nconst lo5 = lowest(d1, 5, 'low');\nconst rangePos5d = hi5 > lo5 ? (price - lo5) / (hi5 - lo5) : 0.5;\n\n// Dollar proxy. EUR/USD up means dollar down, which supports gold, so the\n// sign of this slope maps directly onto a bullish-gold reading.\nlet dollarSlopePct = null;\nlet dollarDir = 0; // +1 supports gold longs, -1 supports shorts, 0 neutral\nif (fx && fx.length >= 5) {\n  const a = fx[fx.length - 5].close;\n  const b = fx[fx.length - 1].close;\n  dollarSlopePct = ((b - a) / a) * 100;\n  if (dollarSlopePct > 0.05) dollarDir = 1;\n  else if (dollarSlopePct < -0.05) dollarDir = -1;\n}\n\n// Session, and the range of the current session so far.\nconst nowUTC = new Date(nowMs);\nconst hourUTC = nowUTC.getUTCHours();\nconst session = sessionForHour(hourUTC);\n\nconst sessionStartHour = { asia: 0, london: 7, ny_overlap: 13, ny_afternoon: 17, late: 21 }[session];\nconst sessionStartMs = Date.UTC(\n  nowUTC.getUTCFullYear(),\n  nowUTC.getUTCMonth(),\n  nowUTC.getUTCDate(),\n  sessionStartHour,\n);\nconst sessionBars = m15.filter((b) => b.t >= sessionStartMs);\nconst sessionHigh = sessionBars.length ? Math.max(...sessionBars.map((b) => b.high)) : null;\nconst sessionLow = sessionBars.length ? Math.min(...sessionBars.map((b) => b.low)) : null;\n\n// First-hour range of the current session (4 x 15m bars from session open).\nconst firstHourBars = m15.filter(\n  (b) => b.t >= sessionStartMs && b.t < sessionStartMs + 60 * 60 * 1000,\n);\nconst firstHourHigh = firstHourBars.length >= 2 ? Math.max(...firstHourBars.map((b) => b.high)) : null;\nconst firstHourLow = firstHourBars.length >= 2 ? Math.min(...firstHourBars.map((b) => b.low)) : null;\n\n// Last two closed 15m bars — used for break-and-hold confirmation.\nconst prev15 = m15.length >= 2 ? m15[m15.length - 2] : null;\n\nreturn [\n  {\n    json: {\n      // identity / display\n      symbol: SYM,\n      label: assetCfg.label,\n      emoji: assetCfg.emoji,\n      lang: assetCfg.lang || 'ru',\n      tsUtc: new Date(nowMs).toISOString(),\n      barAgeMin: round(barAgeMin, 1),\n\n      // price\n      price: round(price, 2),\n      change24hPct: round(change24hPct, 2),\n\n      // 1h trend\n      ema20: round(ema20, 2),\n      ema50: round(ema50, 2),\n      ema200: round(ema200, 2),\n      emaStack,\n      dailyTrend,\n\n      // volatility\n      atr1h: round(atr1h, 2),\n      atrDaily: round(atrDaily, 2),\n      atrPctOfPrice: round((atr1h / price) * 100, 3),\n\n      // structure\n      priorDayHigh: round(priorDay.high, 2),\n      priorDayLow: round(priorDay.low, 2),\n      priorDayClose: round(priorDay.close, 2),\n      priorDayDate: priorDay.datetime.slice(0, 10),\n      swingHigh: round(swingHigh, 2),\n      swingLow: round(swingLow, 2),\n      rangePos5d: round(rangePos5d, 3),\n\n      // compression\n      range8: round(range8, 2),\n      range8High: round(range8High, 2),\n      range8Low: round(range8Low, 2),\n      compressionRatio: round(compressionRatio, 3),\n\n      // session\n      session,\n      hourUTC,\n      sessionStartHour,\n      sessionHigh: round(sessionHigh, 2),\n      sessionLow: round(sessionLow, 2),\n      firstHourHigh: round(firstHourHigh, 2),\n      firstHourLow: round(firstHourLow, 2),\n\n      // intermarket\n      dollarSlopePct: round(dollarSlopePct, 3),\n      dollarDir,\n\n      // raw bars the scorer needs for break/sweep detection\n      last15: {\n        open: round(newest15.open, 2),\n        high: round(newest15.high, 2),\n        low: round(newest15.low, 2),\n        close: round(newest15.close, 2),\n        datetime: newest15.datetime,\n      },\n      prev15: prev15\n        ? {\n            open: round(prev15.open, 2),\n            high: round(prev15.high, 2),\n            low: round(prev15.low, 2),\n            close: round(prev15.close, 2),\n            datetime: prev15.datetime,\n          }\n        : null,\n    },\n    pairedItem: { item: 0 },\n  },\n];\n"
+      },
+      "id": "code-02",
+      "name": "Indicators",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "notes": "Also holds the staleness gate: stale data ends the run with no post.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * NODE 3/5 — Event gate\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Answers one question: how close are we to a high-impact USD release?\n *\n * This is the highest-value single component in the workflow. Most retail\n * damage on gold happens in the fifteen minutes either side of a CPI, NFP or\n * FOMC print. A bot that knows to stand aside there is worth more than one\n * that knows an EMA crossed.\n *\n * WHY THE TRY/CATCH MATTERS: a Code node has no retryOnFail. An unhandled\n * throw here kills the whole run and the channel goes silent. So a calendar\n * outage degrades instead of failing:\n *     fresh cache  -> use it\n *     stale cache  -> use it, flag staleness\n *     no cache     -> eventDataUnknown = true, scorer applies a precautionary\n *                     penalty rather than assuming the coast is clear\n *\n * KNOWN LIMITATION: the feed covers the current FF week (Sunday–Saturday).\n * A Friday run cannot see the following Monday's events. Since the gate only\n * reacts inside a 120-minute window, that gap is harmless.\n * ==========================================================================*/\n\nconst CALENDAR_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';\nconst CACHE_TTL_MIN = 360;   // 6 hours -> ~4 fetches/day\nconst POST_EVENT_WINDOW = 15; // minutes after a print where price is still noise\n\nconst ctx = $input.first().json;\nconst sd = $getWorkflowStaticData('global');\nconst nowMs = Date.now();\n\n// ------------------------------------------------------ cache read / fetch ---\n\nlet events = Array.isArray(sd.calendarEvents) ? sd.calendarEvents : null;\nconst fetchedAt = sd.calendarFetchedAt ? Date.parse(sd.calendarFetchedAt) : 0;\nconst cacheAgeMin = fetchedAt ? (nowMs - fetchedAt) / 60000 : Infinity;\n\nlet eventDataUnknown = false;\nlet calendarStale = false;\nlet calendarSource = 'cache';\n\nif (!events || cacheAgeMin > CACHE_TTL_MIN) {\n  try {\n    // NOTE: this.helpers.httpRequest — NOT $helpers, which is undefined in the\n    // n8n 2.x task-runner sandbox and throws ReferenceError.\n    const res = await this.helpers.httpRequest({\n      method: 'GET',\n      url: CALENDAR_URL,\n      json: true,\n      timeout: 10000,\n    });\n\n    // The endpoint serves a bare JSON array, sometimes as text/plain.\n    const parsed = typeof res === 'string' ? JSON.parse(res) : res;\n    if (!Array.isArray(parsed)) throw new Error('Calendar payload was not an array');\n\n    events = parsed\n      .filter((e) => e && e.country === 'USD' && e.impact === 'High')\n      .map((e) => ({\n        title: String(e.title || 'Unnamed event'),\n        // FF dates carry a US-Eastern offset, so Date.parse handles the zone.\n        ts: Date.parse(e.date),\n      }))\n      .filter((e) => Number.isFinite(e.ts))\n      .sort((a, b) => a.ts - b.ts);\n\n    sd.calendarEvents = events;\n    sd.calendarFetchedAt = new Date(nowMs).toISOString();\n    calendarSource = 'fetched';\n    console.log(`Calendar refreshed: ${events.length} high-impact USD events this week.`);\n  } catch (err) {\n    // Degrade, never die.\n    if (Array.isArray(sd.calendarEvents) && sd.calendarEvents.length > 0) {\n      events = sd.calendarEvents;\n      calendarStale = true;\n      calendarSource = 'stale_cache';\n      console.log(`Calendar fetch failed (${err.message}); using cache from ${sd.calendarFetchedAt}.`);\n    } else {\n      events = [];\n      eventDataUnknown = true;\n      calendarSource = 'unavailable';\n      console.log(`Calendar fetch failed (${err.message}) and no cache exists; assuming event risk.`);\n    }\n  }\n}\n\n// -------------------------------------------------------------- proximity ---\n\nlet minutesToNext = null;\nlet nextEventTitle = null;\nlet nextEventTsUtc = null;\n\nconst upcoming = events.filter((e) => e.ts > nowMs);\nif (upcoming.length > 0) {\n  const next = upcoming[0];\n  minutesToNext = Math.round((next.ts - nowMs) / 60000);\n  nextEventTitle = next.title;\n  nextEventTsUtc = new Date(next.ts).toISOString();\n}\n\n// Did something just print? Price is unreliable for a few minutes afterwards.\nlet minutesSinceLast = null;\nlet lastEventTitle = null;\nconst past = events.filter((e) => e.ts <= nowMs);\nif (past.length > 0) {\n  const last = past[past.length - 1];\n  minutesSinceLast = Math.round((nowMs - last.ts) / 60000);\n  lastEventTitle = last.title;\n}\nconst inPostEventWindow =\n  minutesSinceLast !== null && minutesSinceLast <= POST_EVENT_WINDOW;\n\n/** Human-readable countdown for the message footer. */\nfunction humanise(min) {\n  if (min === null) return null;\n  if (min < 60) return `${min} min`;\n  if (min < 60 * 24) return `${Math.round(min / 60)}h`;\n  return `${Math.round(min / (60 * 24))}d`;\n}\n\nreturn [\n  {\n    json: {\n      ...ctx,\n      eventGate: {\n        minutesToNext,\n        nextEventTitle,\n        nextEventTsUtc,\n        nextEventHuman: humanise(minutesToNext),\n        minutesSinceLast,\n        lastEventTitle,\n        inPostEventWindow,\n        eventDataUnknown,\n        calendarStale,\n        calendarSource,\n        eventCount: events.length,\n      },\n    },\n    pairedItem: { item: 0 },\n  },\n];\n"
+      },
+      "id": "code-03",
+      "name": "Event gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "notes": "Calendar cached 6h in staticData. Degrades to stale cache, then to a precautionary penalty.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * NODE 4/5 — Scorer\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Deterministic. Given the same indicators it always produces the same winner.\n * The LLM downstream never sees this logic and cannot alter a single number.\n *\n * >>> EXTENSION SEAM <<<\n * Add a signal by appending to GENERATORS. A generator returns null when its\n * pattern is absent, or a candidate object. Everything after that — scoring,\n * stops, targets, banding — is shared and needs no change.\n *\n * >>> CALIBRATION KNOB <<<\n * WEIGHTS below is a v1 hypothesis, not a validated model. Nobody can tell you\n * the right number for \"dollar agrees\" without data. The Google Sheets log\n * records which terms fired on every run; after ~2-3 weeks reweight against\n * observed outcomes. Treat these as a starting point.\n * ==========================================================================*/\n\nconst WEIGHTS = {\n  emaAgrees: 15,\n  dollarAgrees: 12,\n  volatilityFits: 10,\n  sessionFits: 8,\n  goodRR: 10,\n  eventWithin60: -40,\n  eventWithin120: -20,\n  dailyConflict: -12,\n  breakoutInAsia: -10,\n};\n\nconst BANDS = { high: 70, medium: 50, low: 30 };\n\nconst STOP_FLOOR_PCT = 0.0030; // 0.30% — ~7 pts at 2,400\nconst STOP_CEIL_PCT = 0.0080;  // 0.80% — ~19 pts at 2,400\nconst STOP_BUFFER_ATR = 0.15;  // how far past the structural level the stop sits\nconst MIN_TARGET_R = 1.2;      // a level closer than this isn't worth targeting\nconst MAX_TARGET_R = 4.0;      // ...and one further than this is a SWING target\nconst DEFAULT_TARGET_R = 2.0;  // fallback when no level is in range\n\nconst c = $input.first().json;\nconst gate = c.eventGate || {};\n\n/* ---------------------------------------------------------------- strings ---\n * Language comes from LANG in 01-fetch-plan.js — do not set it here.\n * These are the strings this node produces: generator display names, the setup\n * notes, and the language name handed to the LLM prompt.\n * Format message owns the message chrome and has its own table.\n */\nconst STRINGS = {\n  ru: {\n    langName: 'Russian (русский)',\n    noSetup: 'Сетап не сформирован.',\n    // ForexFactory event titles arrive in English. Unmapped titles fall through\n    // unchanged — the acronyms (FOMC, CPI, NFP, PMI) are used untranslated by\n    // Russian traders anyway, so an unknown event still reads sensibly.\n    // Lives here rather than in Format because the LLM facts (built below) must\n    // carry the localised name too, or the prose and the chrome disagree.\n    eventNames: {\n      'FOMC Meeting Minutes': 'протокол FOMC',\n      'FOMC Statement': 'решение FOMC',\n      'FOMC Press Conference': 'пресс-конференция FOMC',\n      'Federal Funds Rate': 'ставка ФРС',\n      'CPI m/m': 'ИПЦ м/м',\n      'CPI y/y': 'ИПЦ г/г',\n      'Core CPI m/m': 'базовый ИПЦ м/м',\n      'Core PCE Price Index m/m': 'базовый PCE м/м',\n      'PPI m/m': 'ИЦП м/м',\n      'Core PPI m/m': 'базовый ИЦП м/м',\n      'Non-Farm Employment Change': 'занятость вне с/х (NFP)',\n      'ADP Non-Farm Employment Change': 'занятость ADP',\n      'Unemployment Rate': 'уровень безработицы',\n      'Average Hourly Earnings m/m': 'средняя зарплата м/м',\n      'Unemployment Claims': 'заявки на пособие',\n      'JOLTS Job Openings': 'вакансии JOLTS',\n      'ISM Manufacturing PMI': 'PMI ISM (промышленность)',\n      'ISM Services PMI': 'PMI ISM (услуги)',\n      'Flash Manufacturing PMI': 'предв. PMI (промышленность)',\n      'Flash Services PMI': 'предв. PMI (услуги)',\n      'Retail Sales m/m': 'розничные продажи м/м',\n      'Core Retail Sales m/m': 'базовые розничные продажи м/м',\n      'Advance GDP q/q': 'предв. ВВП кв/кв',\n      'Prelim GDP q/q': 'предв. ВВП кв/кв',\n      'Final GDP q/q': 'итог. ВВП кв/кв',\n      'Fed Chair Powell Speaks': 'выступление Пауэлла',\n      'Fed Chair Powell Testifies': 'выступление Пауэлла в Конгрессе',\n      'Prelim UoM Consumer Sentiment': 'предв. индекс Мичигана',\n      'Consumer Confidence': 'индекс доверия потребителей',\n      'Durable Goods Orders m/m': 'заказы на товары длит. пользования м/м',\n      'Crude Oil Inventories': 'запасы нефти',\n      'Treasury Currency Report': 'валютный отчёт Минфина',\n    },\n    labels: {\n      pdh_pdl_break: 'пробой вчерашнего уровня',\n      liquidity_sweep: 'съём ликвидности',\n      trend_continuation: 'продолжение тренда',\n      session_open_break: 'пробой открытия сессии',\n      mean_reversion: 'возврат к средней',\n      range_squeeze: 'сжатие диапазона',\n      none: 'нет кандидата',\n    },\n    sessionNames: {\n      asia: 'азиатской',\n      london: 'лондонской',\n      ny_overlap: 'лондон/нью-йорк',\n      ny_afternoon: 'нью-йоркской',\n      late: 'поздней',\n    },\n    notes: {\n      break: (up, level) =>\n        `Пробой вчерашнего ${up ? 'максимума' : 'минимума'} на ${level} с удержанием.`,\n      sweep: (up) =>\n        `Прокол вчерашнего ${up ? 'максимума' : 'минимума'} с возвратом внутрь диапазона.`,\n      trendUp: (lvl) => `Тренд 1ч вверх, цена удержала 20 EMA на ${lvl}.`,\n      trendDown: (lvl) => `Тренд 1ч вниз, цена отбилась от 20 EMA на ${lvl}.`,\n      sessionBreak: (session, up, lvl) =>\n        `Пробой ${session} сессии: ${up ? 'максимум' : 'минимум'} первого часа на ${lvl}.`,\n      stretch: (atr, above) =>\n        `Отклонение ${atr} ATR ${above ? 'выше' : 'ниже'} 20 EMA — риск возврата.`,\n      squeeze: (range, ratio, lo, hi) =>\n        `Сжатие в диапазоне ${range} (${ratio} ATR) — направление не определено до пробоя ${lo}/${hi}.`,\n    },\n  },\n  en: {\n    langName: 'English',\n    noSetup: 'No setup pattern present.',\n    eventNames: {}, // already English — pass through unchanged\n    labels: {\n      pdh_pdl_break: 'prior-day break',\n      liquidity_sweep: 'liquidity sweep',\n      trend_continuation: 'trend continuation',\n      session_open_break: 'session open break',\n      mean_reversion: 'mean reversion',\n      range_squeeze: 'range squeeze',\n      none: 'no candidate',\n    },\n    sessionNames: {\n      asia: 'Asia',\n      london: 'London',\n      ny_overlap: 'London/NY',\n      ny_afternoon: 'New York',\n      late: 'late',\n    },\n    notes: {\n      break: (up, level) =>\n        `${up ? 'Broke above' : 'Broke below'} yesterday's ${up ? 'high' : 'low'} at ${level} and held.`,\n      sweep: (up) =>\n        `Wicked ${up ? 'above' : 'below'} yesterday's ${up ? 'high' : 'low'} and closed back inside.`,\n      trendUp: (lvl) => `1h trend up, price held the 20 EMA at ${lvl}.`,\n      trendDown: (lvl) => `1h trend down, price rejected the 20 EMA at ${lvl}.`,\n      sessionBreak: (session, up, lvl) =>\n        `Broke the ${session} opening range ${up ? 'high' : 'low'} at ${lvl}.`,\n      stretch: (atr, above) =>\n        `Stretched ${atr} ATR ${above ? 'above' : 'below'} the 20 EMA — snapback risk.`,\n      squeeze: (range, ratio, lo, hi) =>\n        `Compressed into a ${range} range (${ratio} ATR) — direction unresolved until ${lo}/${hi} breaks.`,\n    },\n  },\n};\n\nconst t = STRINGS[c.lang] || STRINGS.ru;\n\n/** Localise a ForexFactory event title, or return it unchanged if unmapped. */\nfunction eventName(title) {\n  if (!title) return title;\n  return (t.eventNames && t.eventNames[title]) || title;\n}\nconst eventNextLocal = eventName(gate.nextEventTitle);\nconst eventLastLocal = eventName(gate.lastEventTitle);\n\n// ------------------------------------------------------------- generators ---\n// Order matters only for tie-breaking (earlier wins an exact tie).\n\nconst GENERATORS = [\n  {\n    id: 'pdh_pdl_break',\n    label: t.labels.pdh_pdl_break,\n    signalType: 'breakout',\n    generate: (x) => {\n      if (!x.prev15) return null;\n      const brokeUp =\n        x.prev15.close > x.priorDayHigh && x.last15.close > x.priorDayHigh;\n      const brokeDown =\n        x.prev15.close < x.priorDayLow && x.last15.close < x.priorDayLow;\n      if (!brokeUp && !brokeDown) return null;\n\n      const direction = brokeUp ? 'long' : 'short';\n      const level = brokeUp ? x.priorDayHigh : x.priorDayLow;\n      // Already extended well past the level = chasing, so score it lower.\n      const extension = Math.abs(x.price - level) / x.atr1h;\n      return {\n        direction,\n        base: extension > 1.5 ? 40 : 48,\n        structuralLevel: level,\n        note: t.notes.break(brokeUp, level),\n        extension: Math.round(extension * 100) / 100,\n      };\n    },\n  },\n\n  {\n    id: 'liquidity_sweep',\n    label: t.labels.liquidity_sweep,\n    signalType: 'reversal',\n    generate: (x) => {\n      const sweptHigh =\n        x.last15.high > x.priorDayHigh && x.last15.close < x.priorDayHigh;\n      const sweptLow =\n        x.last15.low < x.priorDayLow && x.last15.close > x.priorDayLow;\n      if (!sweptHigh && !sweptLow) return null;\n\n      return {\n        direction: sweptHigh ? 'short' : 'long',\n        base: 45,\n        structuralLevel: sweptHigh ? x.last15.high : x.last15.low,\n        note: t.notes.sweep(sweptHigh),\n      };\n    },\n  },\n\n  {\n    id: 'trend_continuation',\n    label: t.labels.trend_continuation,\n    signalType: 'continuation',\n    generate: (x) => {\n      if (x.emaStack === 0 || x.ema20 === null) return null;\n      const dist = (x.price - x.ema20) / x.atr1h;\n\n      // Long: pulled back toward EMA20 from above and holding.\n      if (x.emaStack === 1 && dist >= -0.2 && dist <= 0.8) {\n        return {\n          direction: 'long',\n          base: Math.abs(dist) < 0.3 ? 42 : 35,\n          structuralLevel: x.ema20,\n          note: t.notes.trendUp(x.ema20),\n        };\n      }\n      // Short: mirror.\n      if (x.emaStack === -1 && dist <= 0.2 && dist >= -0.8) {\n        return {\n          direction: 'short',\n          base: Math.abs(dist) < 0.3 ? 42 : 35,\n          structuralLevel: x.ema20,\n          note: t.notes.trendDown(x.ema20),\n        };\n      }\n      return null;\n    },\n  },\n\n  {\n    id: 'session_open_break',\n    label: t.labels.session_open_break,\n    signalType: 'breakout',\n    generate: (x) => {\n      if (x.firstHourHigh === null || x.firstHourLow === null) return null;\n      // Meaningless while still inside the first hour of the session.\n      if (x.hourUTC <= x.sessionStartHour) return null;\n      if (x.session !== 'london' && x.session !== 'ny_overlap') return null;\n\n      const sessionName = t.sessionNames[x.session] || x.session;\n      if (x.price > x.firstHourHigh) {\n        return {\n          direction: 'long',\n          base: 40,\n          structuralLevel: x.firstHourHigh,\n          note: t.notes.sessionBreak(sessionName, true, x.firstHourHigh),\n        };\n      }\n      if (x.price < x.firstHourLow) {\n        return {\n          direction: 'short',\n          base: 40,\n          structuralLevel: x.firstHourLow,\n          note: t.notes.sessionBreak(sessionName, false, x.firstHourLow),\n        };\n      }\n      return null;\n    },\n  },\n\n  {\n    id: 'mean_reversion',\n    label: t.labels.mean_reversion,\n    signalType: 'reversion',\n    generate: (x) => {\n      if (x.ema20 === null) return null;\n      const stretch = (x.price - x.ema20) / x.atr1h;\n      if (Math.abs(stretch) < 2.0) return null;\n\n      const direction = stretch > 0 ? 'short' : 'long';\n      return {\n        direction,\n        base: Math.abs(stretch) > 2.5 ? 42 : 38,\n        structuralLevel: direction === 'short' ? x.last15.high : x.last15.low,\n        note: t.notes.stretch(Math.abs(stretch).toFixed(1), stretch > 0),\n        stretch: Math.round(stretch * 100) / 100,\n      };\n    },\n  },\n\n  {\n    id: 'range_squeeze',\n    label: t.labels.range_squeeze,\n    signalType: 'compression',\n    // Directionless by construction: compression says a move is coming, not\n    // which way. Capped at LOW downstream so it can never publish a\n    // directional call without an invalidation level.\n    generate: (x) => {\n      if (x.compressionRatio >= 0.6) return null;\n      return {\n        direction: 'none',\n        base: 35,\n        structuralLevel: null,\n        note: t.notes.squeeze(x.range8, x.compressionRatio, x.range8Low, x.range8High),\n        rangeHigh: x.range8High,\n        rangeLow: x.range8Low,\n      };\n    },\n  },\n];\n\n// ------------------------------------------------------- stop and target ----\n\nfunction buildLevels(cand, x) {\n  if (cand.direction === 'none' || cand.structuralLevel === null) {\n    return { entry: x.price, stop: null, target: null, rr: null, stopPct: null };\n  }\n\n  const entry = x.price;\n  const isLong = cand.direction === 'long';\n\n  const rawStop = isLong\n    ? cand.structuralLevel - STOP_BUFFER_ATR * x.atr1h\n    : cand.structuralLevel + STOP_BUFFER_ATR * x.atr1h;\n\n  // Clamp the DISTANCE, not the level, so the published stop always sits\n  // inside the 0.30%–0.80% band the spec requires.\n  const rawDist = Math.abs(entry - rawStop);\n  const dist = Math.min(\n    Math.max(rawDist, STOP_FLOOR_PCT * entry),\n    STOP_CEIL_PCT * entry,\n  );\n  const stop = isLong ? entry - dist : entry + dist;\n\n  // Nearest opposing structural level that is far enough to be worth targeting\n  // but close enough to still be an INTRADAY target.\n  //\n  // The upper bound matters more than it looks. Without it, a swing-scale level\n  // (a 20-bar 1h swing high can sit 3-4% away) becomes the target of a signal\n  // whose stop is 0.5% — producing a published R:R of 7, which is not a real\n  // edge, it is a horizon mismatch. Worse, that fake ratio then earns the\n  // goodRR bonus and inflates the score. Beyond MAX_TARGET_R we ignore the\n  // level and fall back to a plain 2R, which is honest for a 1-12h hold.\n  const candidates = isLong\n    ? [x.priorDayHigh, x.swingHigh, x.sessionHigh]\n    : [x.priorDayLow, x.swingLow, x.sessionLow];\n\n  const viable = candidates\n    .filter((lvl) => Number.isFinite(lvl))\n    .filter((lvl) => (isLong ? lvl > entry : lvl < entry))\n    .filter((lvl) => Math.abs(lvl - entry) >= MIN_TARGET_R * dist)\n    .filter((lvl) => Math.abs(lvl - entry) <= MAX_TARGET_R * dist)\n    .sort((a, b) => Math.abs(a - entry) - Math.abs(b - entry));\n\n  const target =\n    viable.length > 0\n      ? viable[0]\n      : isLong\n        ? entry + DEFAULT_TARGET_R * dist\n        : entry - DEFAULT_TARGET_R * dist;\n\n  return {\n    entry: Math.round(entry * 100) / 100,\n    stop: Math.round(stop * 100) / 100,\n    target: Math.round(target * 100) / 100,\n    rr: Math.round((Math.abs(target - entry) / dist) * 100) / 100,\n    stopPct: Math.round((dist / entry) * 1000) / 10, // e.g. 0.6 meaning 0.6%\n  };\n}\n\n// --------------------------------------------------------------- scoring ----\n\nconst VOL_FIT = {\n  breakout: (atrPct) => atrPct >= 0.12,\n  continuation: (atrPct) => atrPct >= 0.10,\n  reversion: (atrPct) => atrPct >= 0.15,\n  reversal: (atrPct) => atrPct >= 0.12,\n  compression: (atrPct) => atrPct <= 0.20,\n};\n\nconst SESSION_FIT = {\n  breakout: ['london', 'ny_overlap'],\n  continuation: ['london', 'ny_overlap', 'ny_afternoon'],\n  reversion: ['asia', 'ny_afternoon', 'late'],\n  reversal: ['london', 'ny_overlap', 'ny_afternoon'],\n  compression: ['asia', 'late'],\n};\n\nfunction score(cand, gen, x, levels) {\n  const components = {};\n  let total = cand.base;\n  components.base = cand.base;\n\n  const dirSign = cand.direction === 'long' ? 1 : cand.direction === 'short' ? -1 : 0;\n\n  // + 1h EMA stack agrees\n  if (dirSign !== 0 && x.emaStack === dirSign) {\n    total += WEIGHTS.emaAgrees;\n    components.emaAgrees = WEIGHTS.emaAgrees;\n  }\n\n  // + dollar direction supports the trade (EUR/USD up => dollar down => gold up)\n  if (dirSign !== 0 && x.dollarDir === dirSign) {\n    total += WEIGHTS.dollarAgrees;\n    components.dollarAgrees = WEIGHTS.dollarAgrees;\n  }\n\n  // + volatility regime suits this kind of signal\n  const volFn = VOL_FIT[gen.signalType];\n  if (volFn && volFn(x.atrPctOfPrice)) {\n    total += WEIGHTS.volatilityFits;\n    components.volatilityFits = WEIGHTS.volatilityFits;\n  }\n\n  // + session suits this kind of signal\n  if ((SESSION_FIT[gen.signalType] || []).includes(x.session)) {\n    total += WEIGHTS.sessionFits;\n    components.sessionFits = WEIGHTS.sessionFits;\n  }\n\n  // + reward:risk is worth taking\n  if (levels.rr !== null && levels.rr >= 2) {\n    total += WEIGHTS.goodRR;\n    components.goodRR = WEIGHTS.goodRR;\n  }\n\n  // - event risk. Unknown calendar data is treated as the 120-minute case:\n  //   assume risk rather than assume safety.\n  const m = gate.minutesToNext;\n  if (gate.eventDataUnknown) {\n    total += WEIGHTS.eventWithin120;\n    components.eventDataUnknown = WEIGHTS.eventWithin120;\n  } else if (m !== null && m !== undefined) {\n    if (m <= 60) {\n      total += WEIGHTS.eventWithin60;\n      components.eventWithin60 = WEIGHTS.eventWithin60;\n    } else if (m <= 120) {\n      total += WEIGHTS.eventWithin120;\n      components.eventWithin120 = WEIGHTS.eventWithin120;\n    }\n  }\n\n  // OPTIONAL 10th TERM, deliberately not enabled: a penalty for the ~15 min\n  // after a print, when price is still noise. `gate.inPostEventWindow` carries\n  // the flag and the message annotates it, but it does not affect the score,\n  // because the approved spec defines exactly nine terms. Enable by\n  // uncommenting — and log the change, so the Sheets history stays comparable.\n  // if (gate.inPostEventWindow) { total -= 15; components.postEvent = -15; }\n\n  // - daily trend disagrees with the trade\n  if (dirSign !== 0 && x.dailyTrend !== 0 && x.dailyTrend !== dirSign) {\n    total += WEIGHTS.dailyConflict;\n    components.dailyConflict = WEIGHTS.dailyConflict;\n  }\n\n  // - breakouts during the Asia session are usually noise\n  if (gen.signalType === 'breakout' && x.session === 'asia') {\n    total += WEIGHTS.breakoutInAsia;\n    components.breakoutInAsia = WEIGHTS.breakoutInAsia;\n  }\n\n  return {\n    score: Math.max(0, Math.min(100, Math.round(total))),\n    components,\n  };\n}\n\n// -------------------------------------------------------------- evaluate ----\n\nconst evaluated = [];\n\nfor (let i = 0; i < GENERATORS.length; i++) {\n  const gen = GENERATORS[i];\n  let cand;\n  try {\n    cand = gen.generate(c);\n  } catch (err) {\n    // A broken generator must not take the whole run down with it.\n    console.log(`Generator ${gen.id} threw: ${err.message}`);\n    continue;\n  }\n  if (!cand) continue;\n\n  const levels = buildLevels(cand, c);\n  const { score: sc, components } = score(cand, gen, c, levels);\n\n  evaluated.push({\n    id: gen.id,\n    label: gen.label,\n    signalType: gen.signalType,\n    order: i,\n    direction: cand.direction,\n    score: sc,\n    components,\n    note: cand.note,\n    structuralLevel: cand.structuralLevel,\n    ...levels,\n    extras: {\n      extension: cand.extension ?? null,\n      stretch: cand.stretch ?? null,\n      rangeHigh: cand.rangeHigh ?? null,\n      rangeLow: cand.rangeLow ?? null,\n    },\n  });\n}\n\n// Highest score wins. Ties -> higher R:R, then earlier generator order.\nevaluated.sort((a, b) => {\n  if (b.score !== a.score) return b.score - a.score;\n  const arr = a.rr === null ? -1 : a.rr;\n  const brr = b.rr === null ? -1 : b.rr;\n  if (brr !== arr) return brr - arr;\n  return a.order - b.order;\n});\n\nconst winner = evaluated.length > 0 ? evaluated[0] : null;\n\n// ------------------------------------------------------------- banding -----\n\nfunction bandFor(w) {\n  if (!w || w.score < BANDS.low) return 'NO_EDGE';\n  if (w.score >= BANDS.high) return 'HIGH';\n  if (w.score >= BANDS.medium) return 'MEDIUM';\n  return 'LOW';\n}\n\nlet conviction = bandFor(winner);\n\n// A directionless signal never claims a direction, so it can never publish as\n// an actionable HIGH/MEDIUM call. Cap at LOW.\nif (winner && winner.direction === 'none' && conviction !== 'NO_EDGE') {\n  conviction = 'LOW';\n}\n\n// ------------------------------------------------------ repeat detection ----\n\nconst sd = $getWorkflowStaticData('global');\nconst signature = winner ? `${winner.id}|${winner.direction}` : 'none|none';\n\nif (sd.lastSignal === signature) {\n  sd.consecutiveCount = (sd.consecutiveCount || 1) + 1;\n} else {\n  sd.consecutiveCount = 1;\n  sd.lastSignal = signature;\n}\nconst consecutive = sd.consecutiveCount;\n\n// ---------------------------------------------------------------- output ----\n\n// Runner-up context, for the NO_EDGE message and for post-hoc analysis.\nconst runnerUp = evaluated.length > 1 ? evaluated[1] : null;\n\n/**\n * Facts handed to the LLM. Built here because this node owns every number in\n * it; the LLM node's own config then stays a one-line expression.\n *\n * This string is ALSO the whitelist the Format node validates the LLM's reply\n * against — any number in the reply that is not in here (and is above 10) gets\n * the reply discarded in favour of the template. So do not trim it below the\n * set of numbers the prose is legitimately allowed to mention.\n */\nfunction buildFacts(w, band) {\n  const lines = [\n    `asset: ${c.label} (${c.symbol})`,\n    `price: ${c.price}`,\n    `24h change: ${c.change24hPct}%`,\n    `session: ${c.session.replace('_', ' ')}`,\n    `1h trend: ${c.emaStack === 1 ? 'up' : c.emaStack === -1 ? 'down' : 'mixed'}`,\n    `20 EMA: ${c.ema20}`,\n    `dollar: ${c.dollarDir === 1 ? 'softening' : c.dollarDir === -1 ? 'firming' : 'flat'}`,\n    `prior day high: ${c.priorDayHigh}`,\n    `prior day low: ${c.priorDayLow}`,\n    `setup: ${w ? w.label : 'none'}`,\n    `direction: ${w ? w.direction : 'none'}`,\n    `conviction: ${band} (${w ? w.score : 0} of 100)`,\n    `observation: ${w ? w.note : 'No setup pattern present.'}`,\n  ];\n  if (w && w.entry !== null && w.stop !== null) {\n    lines.push(`entry: ${w.entry}`, `stop: ${w.stop}`, `target: ${w.target}`, `risk reward: ${w.rr}`);\n  }\n  if (gate.minutesToNext !== null && gate.minutesToNext !== undefined) {\n    // Localised name so the prose matches the message chrome instead of echoing\n    // the raw English title into a Russian sentence.\n    lines.push(`next high-impact USD event: ${eventNextLocal} in ${gate.nextEventHuman}`);\n  }\n  return lines.join('\\n');\n}\n// The facts stay in English regardless of output language: they are machine\n// input, the LLM reads them fine, and keeping them stable means the Format\n// node's number whitelist is unaffected by a language change.\n\nreturn [\n  {\n    json: {\n      ...c,\n      signal: winner\n        ? {\n            id: winner.id,\n            label: winner.label,\n            signalType: winner.signalType,\n            direction: winner.direction,\n            score: winner.score,\n            conviction,\n            entry: winner.entry,\n            stop: winner.stop,\n            target: winner.target,\n            rr: winner.rr,\n            stopPct: winner.stopPct,\n            note: winner.note,\n            components: winner.components,\n            extras: winner.extras,\n          }\n        : {\n            id: 'none',\n            label: t.labels.none,\n            signalType: null,\n            direction: 'none',\n            score: 0,\n            conviction: 'NO_EDGE',\n            entry: c.price,\n            stop: null,\n            target: null,\n            rr: null,\n            stopPct: null,\n            note: t.noSetup,\n            components: {},\n            extras: {},\n          },\n      llmFacts: buildFacts(winner, conviction),\n      // Consumed by the LLM prompt in build.mjs, so the language setting has a\n      // single home in 01-fetch-plan.js rather than being duplicated there.\n      langName: t.langName,\n      // Localised event titles for Format's chrome — same source as the facts,\n      // so prose and chrome always agree.\n      eventNextLocal,\n      eventLastLocal,\n      consecutive,\n      candidateCount: evaluated.length,\n      runnerUp: runnerUp\n        ? { id: runnerUp.id, label: runnerUp.label, score: runnerUp.score }\n        : null,\n      allCandidates: evaluated.map((e) => ({\n        id: e.id,\n        direction: e.direction,\n        score: e.score,\n      })),\n    },\n    pairedItem: { item: 0 },\n  },\n];\n"
+      },
+      "id": "code-04",
+      "name": "Scorer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ],
+      "notes": "EXTENSION SEAM: add a signal to GENERATORS. CALIBRATION KNOB: WEIGHTS.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You write one or two short sentences describing gold market conditions for a Telegram signal channel.\n\nRULES — these are absolute:\n- Write in this language: {{ $json.langName }}. Use the natural trading vocabulary of that language, as a market analyst would write it — not a literal translation.\n- Write numbers with a PERIOD as the decimal separator (4357.91), never a comma. A comma decimal fails the number check downstream and your text is discarded.\n- Two sentences maximum. Under 200 characters in total.\n- State ONLY numbers that appear in the FACTS below. Never introduce a price, level or percentage that is not listed there.\n- Never use imperative buy/sell language (\"buy\", \"sell\", \"go long\", \"enter here\"). Describe what the market is doing, not what the reader should do.\n- No greeting, no preamble, no disclaimer, no emoji, no hashtags.\n- Plain text only. No markdown and no HTML tags.\n\nThe FACTS are given in English (event names may already be in the target language). Read them and write your response in the language named above.\n\nFACTS:\n{{ $json.llmFacts }}"
+      },
+      "id": "llm-chain",
+      "name": "Write prose",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1120,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Prose only. Numbers are validated against llmFacts in Format; anything invented is discarded in favour of the template."
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "claude-haiku-4-5",
+          "cachedResultName": "Claude Haiku 4.5"
+        },
+        "options": {
+          "temperature": 0.4,
+          "maxTokensToSample": 300
+        }
+      },
+      "id": "llm-model",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        1120,
+        500
+      ],
+      "notes": "Haiku 4.5 is ample for two sentences from supplied numbers (~$1/month). If it errors with Could not get parameter \"model.value\", re-select the model from the dropdown to rewrite it as a resource locator.",
+      "credentials": {
+        "anthropicApi": {
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * NODE 5/5 — Format message\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Builds the Telegram HTML message and the Google Sheets log row.\n *\n * IMPORTANT n8n BEHAVIOUR: the Basic LLM Chain node REPLACES the item json\n * with {text: \"...\"} — it does not pass input fields through. So the scorer's\n * data is read by node reference, and only the prose comes from $input.\n *\n * THE LLM'S LEASH. Its reply is untrusted text. Three checks before it reaches\n * a published message:\n *   1. length cap\n *   2. every number it states (above 10) must appear in the facts it was given\n *   3. HTML-escape what survives\n * Any failure -> the deterministic template is used instead. The message always\n * posts; the prose is the only thing that can degrade.\n *\n * WHY parse_mode HTML AND NOT MarkdownV2: MarkdownV2 requires escaping ~18\n * characters and returns 400 on any unescaped '.' or '-'. Both appear in every\n * price we publish.\n * ==========================================================================*/\n\nconst MAX_PROSE_CHARS = 200;\nconst SMALL_NUMBER_CEILING = 10; // ordinals, \"1h\", \"20 EMA\" — never a gold level\n\nconst s = $('Scorer').first().json;\nconst sig = s.signal;\nconst gate = s.eventGate || {};\n\nconst llmRaw = ($input.first().json && $input.first().json.text) || '';\n\n/* ---------------------------------------------------------------- strings ---\n * Language comes from LANG in 01-fetch-plan.js — do not set it here.\n * This table owns the message chrome. The Scorer owns setup notes and generator\n * names, and hands them over already localised.\n *\n * Adding a language: add a block here, add one to STRINGS in 04-scorer.js, and\n * set LANG in 01-fetch-plan.js. Nothing else changes.\n */\nconst STRINGS = {\n  ru: {\n    dir: { long: 'ЛОНГ', short: 'ШОРТ' },\n    conviction: 'уверенность',\n    entry: 'Вход',\n    stop: 'Стоп',\n    target: 'Цель',\n    rr: 'R:R',\n    market: 'по рынку',\n    // Full phrases, not an adjective plus a glued-on noun: \"лондон/нью-йорк\n    // сессия\" is ungrammatical, and Russian adjective agreement varies by\n    // session name. Any future language gets the same freedom.\n    sessions: {\n      asia: 'азиатская сессия',\n      london: 'лондонская сессия',\n      ny_overlap: 'перекрытие Лондон/Нью-Йорк',\n      ny_afternoon: 'нью-йоркская сессия',\n      late: 'поздняя сессия',\n    },\n    h24: '24ч',\n    noEdge: 'НЕТ СИГНАЛА',\n    standAside: 'вне рынка',\n    watching: 'Наблюдаем',\n    noCall: 'Направление не определено до пробоя одной из границ.',\n    bestCandidate: (label, score) =>\n      `Лучший кандидат — ${label}, ${score}/100. Действовать не на чем.`,\n    nothingWorth: 'Сетап не сформирован. Действовать не на чем.',\n    consecutive: (n) => `↻ ${n}-й запуск подряд — без изменений`,\n    calendarDown: '⚠ Календарь событий недоступен — оценка с осторожностью',\n    eventImminent: (title, when) => `⚠ ${title} через ${when}`,\n    postEvent: (title, min) => `⚠ ${title} вышло ${min} мин назад — цена ещё не устоялась`,\n    nextEvent: (when, title) => `Следующее важное событие по USD: через ${when} (${title})`,\n    health: (msg) => `состояние: ${msg}`,\n    healthCounts: (posted, skipped) =>\n      `${posted} отправлено / ${skipped} пропущено с последней проверки`,\n    disclaimer: 'Аналитический сигнал · решения принимаете самостоятельно',\n    truncated: '…обрезано',\n    units: { min: 'мин', h: 'ч', d: 'д' },\n  },\n  en: {\n    dir: { long: 'LONG', short: 'SHORT' },\n    conviction: 'conviction',\n    entry: 'Entry',\n    stop: 'Stop',\n    target: 'Target',\n    rr: 'R:R',\n    market: 'market',\n    sessions: {\n      asia: 'asia session',\n      london: 'london session',\n      ny_overlap: 'ny overlap',\n      ny_afternoon: 'ny afternoon',\n      late: 'late session',\n    },\n    h24: '24h',\n    noEdge: 'NO EDGE',\n    standAside: 'stand aside',\n    watching: 'Watching',\n    noCall: 'No directional call until one side breaks.',\n    bestCandidate: (label, score) =>\n      `Best candidate was ${label} at ${score}/100. Nothing worth acting on.`,\n    nothingWorth: 'No setup pattern present. Nothing worth acting on.',\n    consecutive: (n) => {\n      const ord = n === 2 ? '2nd' : n === 3 ? '3rd' : `${n}th`;\n      return `↻ ${ord} consecutive run — unchanged`;\n    },\n    calendarDown: '⚠ Event calendar unavailable — scored cautiously',\n    eventImminent: (title, when) => `⚠ ${title} in ${when}`,\n    postEvent: (title, min) => `⚠ ${title} printed ${min} min ago — price still settling`,\n    nextEvent: (when, title) => `Next high-impact USD event: ${when} (${title})`,\n    health: (msg) => `health: ${msg}`,\n    healthCounts: (posted, skipped) => `${posted} posted / ${skipped} skipped since last check`,\n    disclaimer: 'Analytical signal · you make your own decisions',\n    truncated: '…truncated',\n    units: { min: 'min', h: 'h', d: 'd' },\n  },\n};\n\n// Event titles are localised by the Scorer (which owns the map, because it also\n// builds the LLM facts) and arrive here already translated as eventNextLocal /\n// eventLastLocal. Format just displays them.\n\nconst t = STRINGS[s.lang] || STRINGS.ru;\n\n// ------------------------------------------------------------- validation ---\n\nfunction escapeHtml(str) {\n  return String(str)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n}\n\n/** Normalised numeric tokens: \"2,412.30\" -> \"2412.30\" */\nfunction numberTokens(str) {\n  const matches = String(str).replace(/,/g, '').match(/\\d+(?:\\.\\d+)?/g);\n  return matches || [];\n}\n\nfunction validateProse(raw, factsStr) {\n  const text = String(raw).trim();\n  if (!text) return { ok: false, reason: 'empty' };\n  if (text.length > MAX_PROSE_CHARS) {\n    return { ok: false, reason: `too long (${text.length} chars)` };\n  }\n\n  const allowed = new Set(numberTokens(factsStr));\n  for (const tok of numberTokens(text)) {\n    if (parseFloat(tok) <= SMALL_NUMBER_CEILING) continue; // harmless small ints\n    if (!allowed.has(tok)) {\n      return { ok: false, reason: `invented number \"${tok}\"` };\n    }\n  }\n  return { ok: true, text };\n}\n\n/** Deterministic fallback — always available, never wrong. */\nfunction templateProse() {\n  if (sig.conviction === 'NO_EDGE') {\n    return s.runnerUp\n      ? t.bestCandidate(s.runnerUp.label, s.runnerUp.score)\n      : t.nothingWorth;\n  }\n  return sig.note; // already localised by the Scorer\n}\n\nconst verdict = validateProse(llmRaw, s.llmFacts);\nconst prose = verdict.ok ? escapeHtml(verdict.text) : templateProse();\n\nif (!verdict.ok) {\n  console.log(`LLM prose rejected (${verdict.reason}); using template. Raw: ${String(llmRaw).slice(0, 300)}`);\n}\n\n// ------------------------------------------------------------- heartbeat ----\n\nconst sd = $getWorkflowStaticData('global');\nconst todayUTC = s.tsUtc.slice(0, 10);\n\nsd.dayPosted = (sd.dayPosted || 0) + 1;\n\nlet heartbeat = null;\nif (sd.heartbeatDate !== todayUTC && new Date(s.tsUtc).getUTCHours() >= 8) {\n  const posted = sd.dayPosted || 0;\n  const skipped = sd.skipped || 0;\n  heartbeat = t.healthCounts(posted, skipped);\n  sd.heartbeatDate = todayUTC;\n  sd.dayPosted = 0;\n  sd.skipped = 0;\n}\n\n// --------------------------------------------------------------- message ----\n\nconst arrow = s.change24hPct > 0.05 ? '▲' : s.change24hPct < -0.05 ? '▼' : '▬';\n// Explicit +/- with an ASCII hyphen, matching the stop/target block. (An arrow\n// already shows direction, but the signed number is unambiguous on its own.)\nconst chg = `${s.change24hPct > 0 ? '+' : ''}${s.change24hPct}`;\nconst sessionLabel = t.sessions[s.session] || s.session.replace(/_/g, ' ');\n// Session names are our own strings, never user input — but escape anyway so a\n// future language containing & or < cannot break the HTML parse.\n\nfunction fmt(n) {\n  return n === null || n === undefined\n    ? '—'\n    : Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n}\n\nconst lines = [];\n\n// Header\nlines.push(`${s.emoji} <b>${escapeHtml(s.label)} · ${escapeHtml(s.symbol)}</b>   ${fmt(s.price)}`);\nlines.push(\n  `${arrow} ${chg}% (${t.h24}) · ${escapeHtml(sessionLabel)}`,\n);\nlines.push('');\n\n// Body\nif (sig.conviction === 'NO_EDGE') {\n  lines.push(`<b>${t.noEdge}</b> · ${t.standAside}`);\n  lines.push(prose);\n} else if (sig.direction === 'none') {\n  // range_squeeze and any future directionless signal: levels, never a call.\n  lines.push(`<b>${escapeHtml(sig.label.toUpperCase())}</b> · ${t.conviction} ${sig.score}/100`);\n  lines.push(`${t.watching}  ${fmt(sig.extras.rangeLow)} / ${fmt(sig.extras.rangeHigh)}`);\n  lines.push(t.noCall);\n  lines.push('');\n  lines.push(prose);\n} else {\n  const isLong = sig.direction === 'long';\n  const dir = isLong ? t.dir.long : t.dir.short;\n  const tgtPct = ((Math.abs(sig.target - sig.entry) / sig.entry) * 100).toFixed(1);\n\n  // Signs are relative to ENTRY, not to the trade's intent. On a short the stop\n  // sits ABOVE entry and the target BELOW, so the signs invert. Getting this\n  // backwards puts \"-0.3%\" next to a higher number, which reads as a typo at\n  // best and as the wrong direction at worst.\n  const stopSign = isLong ? '-' : '+';\n  const tgtSign = isLong ? '+' : '-';\n\n  // Pad the labels to a common width so the monospace block stays aligned in\n  // any language — \"Entry/Stop/Target\" and \"Вход/Стоп/Цель\" differ in length.\n  const w = Math.max(t.entry.length, t.stop.length, t.target.length) + 3;\n  const pad = (label) => label + ' '.repeat(Math.max(1, w - label.length));\n\n  lines.push(`<b>${dir}</b> · ${t.conviction} ${sig.score}/100`);\n  // One <pre> block, not three inline <code> spans. Stacked <code> aligns on\n  // Telegram desktop but not mobile, which pads inline code independently.\n  // <pre> is the only element Telegram renders true fixed-width on every client.\n  const block = [\n    `${pad(t.entry)}${fmt(sig.entry)}  (${t.market})`,\n    `${pad(t.stop)}${fmt(sig.stop)}  (${stopSign}${sig.stopPct}%)`,\n    `${pad(t.target)}${fmt(sig.target)}  (${tgtSign}${tgtPct}%)  ·  ${t.rr} ${sig.rr}`,\n  ].join('\\n');\n  lines.push(`<pre>${block}</pre>`);\n  lines.push('');\n  lines.push(prose);\n}\n\n// Repeat marker — only for a live directional signal. \"Still LONG, 3rd run\"\n// says the setup is holding; \"still no edge, 15th run\" just climbs forever and\n// clutters every quiet window (most 30-min windows are NO_EDGE).\nif (s.consecutive > 1 && sig.direction !== 'none') {\n  lines.push('');\n  lines.push(`<i>${t.consecutive(s.consecutive)}</i>`);\n}\n\n// Event line. The countdown from the Event gate is language-neutral digits plus\n// a unit suffix, so translate the unit here rather than re-deriving the value.\nconst when = gate.nextEventHuman\n  ? gate.nextEventHuman\n      .replace(/\\bmin\\b/, t.units.min)\n      .replace(/(\\d)h$/, `$1${t.units.h}`)\n      .replace(/(\\d)d$/, `$1${t.units.d}`)\n  : null;\n\nlines.push('');\nconst nextEventTitleLocal = s.eventNextLocal || gate.nextEventTitle;\nconst lastEventTitleLocal = s.eventLastLocal || gate.lastEventTitle;\n\nif (gate.eventDataUnknown) {\n  lines.push(`<i>${t.calendarDown}</i>`);\n} else if (gate.minutesToNext !== null && gate.minutesToNext <= 60) {\n  lines.push(`<b>${t.eventImminent(escapeHtml(nextEventTitleLocal), when)}</b>`);\n} else if (gate.inPostEventWindow) {\n  lines.push(`<i>${t.postEvent(escapeHtml(lastEventTitleLocal), gate.minutesSinceLast)}</i>`);\n} else if (when) {\n  lines.push(`<i>${t.nextEvent(when, escapeHtml(nextEventTitleLocal))}</i>`);\n}\n\n// Footer\nif (heartbeat) lines.push(`<i>${t.health(heartbeat)}</i>`);\nlines.push(`<i>${t.disclaimer}</i>`);\n\nconst messageHtml = lines.join('\\n');\n\n// Telegram hard-fails above 4096 characters. We run ~450, but never gamble.\nconst messageFinal =\n  messageHtml.length > 4000 ? `${messageHtml.slice(0, 3950)}\\n<i>${t.truncated}</i>` : messageHtml;\n\n// Notify only on HIGH and MEDIUM. This is what keeps 48 messages/day tolerable:\n// the channel carries everything, the phone only buzzes for something actionable.\nconst notified = sig.conviction === 'HIGH' || sig.conviction === 'MEDIUM';\n\n// ---------------------------------------------------------------- output ----\n\nreturn [\n  {\n    json: {\n      // --- Telegram ---\n      messageHtml: messageFinal,\n      disableNotification: !notified,\n\n      // --- Google Sheets log (column names must match the sheet header) ---\n      ts_utc: s.tsUtc,\n      price: s.price,\n      signal_id: sig.id,\n      direction: sig.direction,\n      score: sig.score,\n      conviction: sig.conviction,\n      entry: sig.entry,\n      stop: sig.stop,\n      target: sig.target,\n      rr: sig.rr,\n      components: JSON.stringify(sig.components),\n      event_gate_min: gate.minutesToNext === null || gate.minutesToNext === undefined ? '' : gate.minutesToNext,\n      session: s.session,\n      consecutive: s.consecutive,\n      notified: notified,\n      outcome_24h: '', // filled manually in phase 1; phase-2 workflow backfills\n\n      // --- diagnostics, not logged to the sheet ---\n      _proseSource: verdict.ok ? 'llm' : `template (${verdict.reason})`,\n      _candidateCount: s.candidateCount,\n      _allCandidates: s.allCandidates,\n      _calendarSource: gate.calendarSource,\n    },\n    pairedItem: { item: 0 },\n  },\n];\n"
+      },
+      "id": "code-05",
+      "name": "Format message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        300
+      ],
+      "notes": "Reads the Scorer by node reference because the LLM chain replaces the item json.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * NODE 6/6 — Log row\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Sits between Format message and Log to Sheets, and emits ONLY the 16 columns\n * the sheet is designed to hold.\n *\n * WHY THIS NODE EXISTS: the Google Sheets node's \"Map Automatically\" mode does\n * not ignore input fields that have no matching header — it CREATES a column\n * for each one. Wiring Format message straight into it added six unwanted\n * columns (messageHtml, disableNotification and the four _diagnostics), putting\n * a 500-character HTML blob in every row and letting the sheet schema be\n * decided by whatever happened to be on the item.\n *\n * The schema is a design decision, not an emergent property. This node is the\n * one place that decides it.\n *\n * The diagnostics are still visible on the Format message node in the n8n UI\n * for debugging. To log one deliberately — _proseSource is the useful one, since\n * it tells you how often the LLM's prose is being rejected — add the header to\n * the sheet AND add the field to COLUMNS below. Both, in that order.\n * ==========================================================================*/\n\nconst COLUMNS = [\n  'ts_utc',\n  'price',\n  'signal_id',\n  'direction',\n  'score',\n  'conviction',\n  'entry',\n  'stop',\n  'target',\n  'rr',\n  'components',\n  'event_gate_min',\n  'session',\n  'consecutive',\n  'notified',\n  'outcome_24h',\n];\n\nconst src = $input.first().json;\n\nconst row = {};\nfor (const col of COLUMNS) {\n  const v = src[col];\n  // Blank out null/undefined so the cell is empty rather than reading \"null\".\n  // Note `??` deliberately preserves false and 0, which are real values here\n  // (notified can be false, and event_gate_min or score can legitimately be 0).\n  row[col] = v ?? '';\n}\n\nreturn [{ json: row, pairedItem: { item: 0 } }];\n"
+      },
+      "id": "code-06",
+      "name": "Log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        400
+      ],
+      "notes": "Emits only the 16 sheet columns. Google Sheets autoMap CREATES a column for any unmatched input field, so Format must not feed it directly.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "chatId": "-1004334466444",
+        "text": "={{ $json.messageHtml }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_notification": "={{ $json.disableNotification }}",
+          "appendAttribution": false
+        }
+      },
+      "id": "telegram-send",
+      "name": "Send to channel",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1560,
+        200
+      ],
+      "notes": "HTML parse mode, not MarkdownV2 — MarkdownV2 400s on any unescaped . or - and every price has both.",
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram gold bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1AdbcG-_gpjtzoLZfKXeK8ZU8_XpVYQq1ce7AgQDRBgY"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "signals"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-log",
+      "name": "Log to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1780,
+        400
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "autoMapInputData matches the 16 header columns by name; extra fields (messageHtml, _diagnostics) are ignored.",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build fetch plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build fetch plan": {
+      "main": [
+        [
+          {
+            "node": "Fetch series",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch series": {
+      "main": [
+        [
+          {
+            "node": "Indicators",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Indicators": {
+      "main": [
+        [
+          {
+            "node": "Event gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event gate": {
+      "main": [
+        [
+          {
+            "node": "Scorer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scorer": {
+      "main": [
+        [
+          {
+            "node": "Write prose",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write prose": {
+      "main": [
+        [
+          {
+            "node": "Format message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format message": {
+      "main": [
+        [
+          {
+            "node": "Send to channel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log row": {
+      "main": [
+        [
+          {
+            "node": "Log to Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Write prose",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "timezone": "UTC"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,8 @@
+# Unrelated ChatGPT images that happen to live in this folder
+ChatGPT Image*.png
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
