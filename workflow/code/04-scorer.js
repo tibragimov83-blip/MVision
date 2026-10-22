@@ -30,6 +30,10 @@ const WEIGHTS = {
 };
 
 const BANDS = { high: 70, medium: 50, low: 30 };
+// Above this score every confirmation has stacked and the setup is crowded; the
+// backtest shows it reverses (see the CROWDING CEILING note in the banding
+// section). Demoted to LOW rather than published as HIGH.
+const CROWDED_CEILING = 90;
 
 const STOP_FLOOR_PCT = 0.0030; // 0.30% — ~7 pts at 2,400
 const STOP_CEIL_PCT = 0.0080;  // 0.80% — ~19 pts at 2,400
@@ -91,8 +95,6 @@ const STRINGS = {
       'Treasury Currency Report': 'валютный отчёт Минфина',
     },
     labels: {
-      pdh_pdl_break: 'пробой вчерашнего уровня',
-      liquidity_sweep: 'съём ликвидности',
       trend_continuation: 'продолжение тренда',
       session_open_break: 'пробой открытия сессии',
       mean_reversion: 'возврат к средней',
@@ -107,10 +109,6 @@ const STRINGS = {
       late: 'поздней',
     },
     notes: {
-      break: (up, level) =>
-        `Пробой вчерашнего ${up ? 'максимума' : 'минимума'} на ${level} с удержанием.`,
-      sweep: (up) =>
-        `Прокол вчерашнего ${up ? 'максимума' : 'минимума'} с возвратом внутрь диапазона.`,
       trendUp: (lvl) => `Тренд 1ч вверх, цена удержала 20 EMA на ${lvl}.`,
       trendDown: (lvl) => `Тренд 1ч вниз, цена отбилась от 20 EMA на ${lvl}.`,
       sessionBreak: (session, up, lvl) =>
@@ -126,8 +124,6 @@ const STRINGS = {
     noSetup: 'No setup pattern present.',
     eventNames: {}, // already English — pass through unchanged
     labels: {
-      pdh_pdl_break: 'prior-day break',
-      liquidity_sweep: 'liquidity sweep',
       trend_continuation: 'trend continuation',
       session_open_break: 'session open break',
       mean_reversion: 'mean reversion',
@@ -142,10 +138,6 @@ const STRINGS = {
       late: 'late',
     },
     notes: {
-      break: (up, level) =>
-        `${up ? 'Broke above' : 'Broke below'} yesterday's ${up ? 'high' : 'low'} at ${level} and held.`,
-      sweep: (up) =>
-        `Wicked ${up ? 'above' : 'below'} yesterday's ${up ? 'high' : 'low'} and closed back inside.`,
       trendUp: (lvl) => `1h trend up, price held the 20 EMA at ${lvl}.`,
       trendDown: (lvl) => `1h trend down, price rejected the 20 EMA at ${lvl}.`,
       sessionBreak: (session, up, lvl) =>
@@ -172,52 +164,13 @@ const eventLastLocal = eventName(gate.lastEventTitle);
 // Order matters only for tie-breaking (earlier wins an exact tie).
 
 const GENERATORS = [
-  {
-    id: 'pdh_pdl_break',
-    label: t.labels.pdh_pdl_break,
-    signalType: 'breakout',
-    generate: (x) => {
-      if (!x.prev15) return null;
-      const brokeUp =
-        x.prev15.close > x.priorDayHigh && x.last15.close > x.priorDayHigh;
-      const brokeDown =
-        x.prev15.close < x.priorDayLow && x.last15.close < x.priorDayLow;
-      if (!brokeUp && !brokeDown) return null;
-
-      const direction = brokeUp ? 'long' : 'short';
-      const level = brokeUp ? x.priorDayHigh : x.priorDayLow;
-      // Already extended well past the level = chasing, so score it lower.
-      const extension = Math.abs(x.price - level) / x.atr1h;
-      return {
-        direction,
-        base: extension > 1.5 ? 40 : 48,
-        structuralLevel: level,
-        note: t.notes.break(brokeUp, level),
-        extension: Math.round(extension * 100) / 100,
-      };
-    },
-  },
-
-  {
-    id: 'liquidity_sweep',
-    label: t.labels.liquidity_sweep,
-    signalType: 'reversal',
-    generate: (x) => {
-      const sweptHigh =
-        x.last15.high > x.priorDayHigh && x.last15.close < x.priorDayHigh;
-      const sweptLow =
-        x.last15.low < x.priorDayLow && x.last15.close > x.priorDayLow;
-      if (!sweptHigh && !sweptLow) return null;
-
-      return {
-        direction: sweptHigh ? 'short' : 'long',
-        base: 45,
-        structuralLevel: sweptHigh ? x.last15.high : x.last15.low,
-        note: t.notes.sweep(sweptHigh),
-      };
-    },
-  },
-
+  // REMOVED (Task 1.2): pdh_pdl_break and liquidity_sweep. The offline backtest
+  // (workflow/backtest/) measured both with negative expectancy over ~7 weeks —
+  // pdh_pdl_break at 46% of all signals and −0.10 avgR was the single biggest
+  // drag on the system. Deleting them lifted distinct-prediction avgR from −0.10
+  // to +0.05. If a future data source (Phase 2 real yields / DXY) makes a
+  // break-based setup viable, re-add it here and re-run the backtest before
+  // trusting it — don't restore on intuition.
   {
     id: 'trend_continuation',
     label: t.labels.trend_continuation,
@@ -478,10 +431,24 @@ function score(cand, gen, x, levels) {
 
 // -------------------------------------------------------------- evaluate ----
 
+// ponytail: backtest-only seam. n8n never sets this env var — and its sandbox
+// may not even expose `process` — so the typeof guard makes this an empty set
+// live: zero behaviour change. The backtest sets BACKTEST_DISABLE=id,id to
+// measure the reshuffled system when a generator is deleted.
+const DISABLED = new Set(
+  (typeof process !== 'undefined' && process.env && process.env.BACKTEST_DISABLE
+    ? process.env.BACKTEST_DISABLE.split(',')
+    : []
+  )
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+
 const evaluated = [];
 
 for (let i = 0; i < GENERATORS.length; i++) {
   const gen = GENERATORS[i];
+  if (DISABLED.has(gen.id)) continue;
   let cand;
   try {
     cand = gen.generate(c);
@@ -541,6 +508,19 @@ let conviction = bandFor(winner);
 // an actionable HIGH/MEDIUM call. Cap at LOW.
 if (winner && winner.direction === 'none' && conviction !== 'NO_EDGE') {
   conviction = 'LOW';
+}
+
+// CROWDING CEILING (Task 1.3). A score only reaches ~90 when every confirmation
+// stacks — EMA, dollar, session, R:R and the daily trend all agree. The offline
+// backtest showed that band is a trap: the 90–99 bucket ran 13% wins / −0.58
+// avgR over ~7 weeks, by far the worst of any score band, while 70–89 was the
+// best (+0.20). "Everyone agrees" means the move is already priced. So an
+// over-confirmed setup is demoted to LOW (silent) rather than shouted as HIGH.
+// The cap is recorded in components so the Sheet shows why it was downgraded.
+// Regime-dependent — revisit once live outcome data (Task 0.2) accumulates.
+if (winner && winner.score >= CROWDED_CEILING && conviction !== 'NO_EDGE') {
+  conviction = 'LOW';
+  winner.components = { ...winner.components, crowdedCap: winner.score };
 }
 
 // ------------------------------------------------------ repeat detection ----

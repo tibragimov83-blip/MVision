@@ -339,6 +339,136 @@ const errorWorkflow = {
   pinData: {},
 };
 
+// --------------------------------------------------- outcome tracker (0.2) --
+// A separate DAILY workflow. Reads the signals log, scores every row whose 24h
+// window has closed (target hit first / stop hit first / neither), and writes
+// the result back to outcome_24h. One Twelve Data call per run; zero on a quiet
+// day. This is what turns the passive log into a scorecard — Task 0.2.
+
+const trackerNodes = [
+  {
+    parameters: {
+      rule: {
+        // Once a day, 22:30 UTC, weekdays. After the US session settles and a
+        // full 24h has elapsed for the prior day's signals. ~22 executions/mo.
+        interval: [{ field: 'cronExpression', expression: '30 22 * * 1-5' }],
+      },
+    },
+    id: 'tracker-schedule',
+    name: 'Daily trigger',
+    type: 'n8n-nodes-base.scheduleTrigger',
+    typeVersion: 1.2,
+    position: [-200, 300],
+    notes: 'Daily. Scores yesterday\'s signals once their 24h window has closed.',
+  },
+  {
+    parameters: {
+      operation: 'read',
+      documentId: { __rl: true, mode: 'id', value: GOOGLE_SHEET_ID },
+      sheetName: { __rl: true, mode: 'name', value: 'signals' },
+      options: {},
+    },
+    id: 'sheets-read',
+    name: 'Read signals',
+    type: 'n8n-nodes-base.googleSheets',
+    typeVersion: 4.5,
+    position: [20, 300],
+    notes: 'Reads all rows. Verify the operation shows as "Read Rows" after import.',
+    credentials: { googleSheetsOAuth2Api: { name: 'Google Sheets account' } },
+  },
+  {
+    parameters: { mode: 'runOnceForAllItems', jsCode: js('tracker-01-select.js') },
+    id: 'tracker-select',
+    name: 'Select pending',
+    type: 'n8n-nodes-base.code',
+    typeVersion: 2,
+    position: [240, 300],
+    notes: 'Keeps only directional rows with no outcome whose 24h window has closed. Empty -> run ends, no API call.',
+  },
+  {
+    parameters: {
+      url: 'https://api.twelvedata.com/time_series',
+      authentication: 'genericCredentialType',
+      genericAuthType: 'httpQueryAuth',
+      sendQuery: true,
+      queryParameters: {
+        parameters: [
+          { name: 'symbol', value: 'XAU/USD' },
+          { name: 'interval', value: '15min' },
+          // 500 x 15min ≈ 5.2 days — covers daily runs and a few missed days.
+          { name: 'outputsize', value: '500' },
+          { name: 'timezone', value: 'UTC' },
+        ],
+      },
+      options: { response: { response: { neverError: true } } },
+    },
+    id: 'http-td-tracker',
+    name: 'Fetch 15min',
+    type: 'n8n-nodes-base.httpRequest',
+    typeVersion: 4.2,
+    position: [460, 300],
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 3000,
+    notes: 'One call per run. Same Twelve Data query-auth credential as the main workflow.',
+    credentials: { httpQueryAuth: { name: 'Twelve Data apikey' } },
+  },
+  {
+    parameters: { mode: 'runOnceForAllItems', jsCode: js('tracker-02-classify.js') },
+    id: 'tracker-classify',
+    name: 'Classify',
+    type: 'n8n-nodes-base.code',
+    typeVersion: 2,
+    position: [680, 300],
+    notes: 'Walks each row\'s 24h window: target / stop / none / no_data. Same logic as the backtest.',
+  },
+  {
+    parameters: {
+      operation: 'update',
+      documentId: { __rl: true, mode: 'id', value: GOOGLE_SHEET_ID },
+      sheetName: { __rl: true, mode: 'name', value: 'signals' },
+      columns: {
+        mappingMode: 'autoMapInputData',
+        // Find the row by its unique timestamp, write only outcome_24h.
+        matchingColumns: ['ts_utc'],
+        schema: [],
+      },
+      options: {},
+    },
+    id: 'sheets-update',
+    name: 'Update outcome',
+    type: 'n8n-nodes-base.googleSheets',
+    typeVersion: 4.5,
+    position: [900, 300],
+    // A failed write must not wedge the run; the row stays pending and retries.
+    onError: 'continueRegularOutput',
+    notes: 'Update Row, matching on ts_utc. Verify the operation + matching column after import.',
+    credentials: { googleSheetsOAuth2Api: { name: 'Google Sheets account' } },
+  },
+];
+
+const trackerConnections = {
+  'Daily trigger': { main: [[{ node: 'Read signals', type: 'main', index: 0 }]] },
+  'Read signals': { main: [[{ node: 'Select pending', type: 'main', index: 0 }]] },
+  'Select pending': { main: [[{ node: 'Fetch 15min', type: 'main', index: 0 }]] },
+  'Fetch 15min': { main: [[{ node: 'Classify', type: 'main', index: 0 }]] },
+  Classify: { main: [[{ node: 'Update outcome', type: 'main', index: 0 }]] },
+};
+
+const trackerWorkflow = {
+  name: 'Gold signals — outcome tracker',
+  nodes: trackerNodes,
+  connections: trackerConnections,
+  settings: {
+    executionOrder: 'v1',
+    saveDataErrorExecution: 'all',
+    saveDataSuccessExecution: 'all',
+    saveExecutionProgress: false,
+    timezone: 'UTC',
+  },
+  pinData: {},
+};
+
 // ----------------------------------------------------------------- write ----
 
 const out = (name, obj) => {
@@ -351,6 +481,7 @@ const out = (name, obj) => {
 console.log('Building workflow JSON from code/ sources:');
 out('gold-signals-main.json', mainWorkflow);
 out('gold-signals-error.json', errorWorkflow);
+out('gold-signals-tracker.json', trackerWorkflow);
 
 // Also emit the prompt as plain text. The Write prose node's Text field is the
 // one thing you cannot update by pasting a code/*.js file, so this makes it
@@ -361,29 +492,36 @@ console.log('  code/write-prose-prompt.txt  (paste into the Write prose node)');
 
 // Sanity: every Code node must carry non-empty code, and every connection must
 // point at a node that exists. A silent typo here becomes a broken import.
-const names = new Set(mainNodes.map((n) => n.name));
-let problems = 0;
-for (const n of mainNodes) {
-  if (n.type === 'n8n-nodes-base.code' && !n.parameters.jsCode.trim()) {
-    console.log(`  ! ${n.name} has empty jsCode`);
-    problems++;
+function validate(nodes, connections, label) {
+  const names = new Set(nodes.map((n) => n.name));
+  let problems = 0;
+  for (const n of nodes) {
+    if (n.type === 'n8n-nodes-base.code' && !n.parameters.jsCode.trim()) {
+      console.log(`  ! [${label}] ${n.name} has empty jsCode`);
+      problems++;
+    }
   }
-}
-for (const [from, ports] of Object.entries(mainConnections)) {
-  if (!names.has(from)) {
-    console.log(`  ! connection source "${from}" is not a node`);
-    problems++;
-  }
-  for (const conns of Object.values(ports)) {
-    for (const group of conns) {
-      for (const c of group) {
-        if (!names.has(c.node)) {
-          console.log(`  ! connection target "${c.node}" is not a node`);
-          problems++;
+  for (const [from, ports] of Object.entries(connections)) {
+    if (!names.has(from)) {
+      console.log(`  ! [${label}] connection source "${from}" is not a node`);
+      problems++;
+    }
+    for (const conns of Object.values(ports)) {
+      for (const group of conns) {
+        for (const c of group) {
+          if (!names.has(c.node)) {
+            console.log(`  ! [${label}] connection target "${c.node}" is not a node`);
+            problems++;
+          }
         }
       }
     }
   }
+  return problems;
 }
+
+const problems =
+  validate(mainNodes, mainConnections, 'main') +
+  validate(trackerNodes, trackerConnections, 'tracker');
 console.log(problems === 0 ? 'Structure OK.' : `${problems} structural problem(s).`);
 if (problems > 0) process.exit(1);

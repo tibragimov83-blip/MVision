@@ -427,7 +427,9 @@ console.log('Running self-check…\n');
   check('1b. indicators produced a positive ATR', r.indicators.atr1h > 0, `atr1h=${r.indicators?.atr1h}`);
   check('1c. prior-day high read from the completed bar, not today', r.indicators.priorDayHigh === 2400, `got ${r.indicators?.priorDayHigh}`);
   check('1d. a candidate fired', r.signal.candidateCount > 0);
-  check('1e. break signal won', sig.id === 'pdh_pdl_break', `winner was ${sig.id}`);
+  // pdh_pdl_break removed in Task 1.2 — the surviving generator for an uptrend
+  // holding above the 20 EMA is trend_continuation.
+  check('1e. trend signal won', sig.id === 'trend_continuation', `winner was ${sig.id}`);
   check('1f. direction is long', sig.direction === 'long', `got ${sig.direction}`);
   check('1g. stop is below entry for a long', sig.stop < sig.entry, `entry=${sig.entry} stop=${sig.stop}`);
   check('1h. target is above entry for a long', sig.target > sig.entry, `entry=${sig.entry} target=${sig.target}`);
@@ -642,7 +644,7 @@ console.log('Running self-check…\n');
   dump('SCENARIO 11 — downtrend breaking prior-day low', r);
   const sig = r.signal.signal;
 
-  check('11a. break signal won on the short side', sig.id === 'pdh_pdl_break', `winner=${sig.id}`);
+  check('11a. trend signal won on the short side', sig.id === 'trend_continuation', `winner=${sig.id}`);
   check('11b. direction is short', sig.direction === 'short', `got ${sig.direction}`);
   check('11c. stop is ABOVE entry for a short', sig.stop > sig.entry, `entry=${sig.entry} stop=${sig.stop}`);
   check('11d. target is BELOW entry for a short', sig.target < sig.entry, `entry=${sig.entry} target=${sig.target}`);
@@ -676,11 +678,14 @@ console.log('Running self-check…\n');
   // It must be rejected in favour of the 2R fallback.
   // price MUST equal last15.close — node 2 always produces them equal, so a
   // context where they disagree would test a state that cannot occur.
+  // ema20 sits just below price (dist ≈ 0.67 ATR) so trend_continuation fires a
+  // long — a pullback hold, not a stretch. (Before Task 1.2 this context won via
+  // pdh_pdl_break; that generator is gone, so the long comes from the trend.)
   const s = await runScorerDirect({
     emaStack: 1,
     dailyTrend: 1,
     price: 2405,
-    ema20: 2388,
+    ema20: 2401,
     last15: { open: 2401, high: 2406, low: 2400, close: 2405, datetime: '2026-08-19 14:00:00' },
     prev15: { open: 2400, high: 2403, low: 2399, close: 2402, datetime: '2026-08-19 13:45:00' },
     swingHigh: 2535,     // ~5.4% away — a swing level, not an intraday target
@@ -720,7 +725,7 @@ console.log('Running self-check…\n');
     !/(asia|london|ny overlap|ny afternoon|late) session|ny overlap/.test(msg),
     headerLine,
   );
-  check('13g. scorer note is localised', /Пробой вчерашнего/.test(sig.note), sig.note);
+  check('13g. scorer note is localised', /Тренд 1ч вверх/.test(sig.note), sig.note);
   check('13h. langName is handed to the LLM prompt', r.signal.langName.includes('Russian'), r.signal.langName);
   check('13i. Russian prose passes validation', r.formatted._proseSource === 'llm', r.formatted._proseSource);
 
@@ -777,6 +782,32 @@ console.log('Running self-check…\n');
   });
   const msg = fmt[0].json.messageHtml;
   check('15b. NO_EDGE does not show the repeat marker', !/consecutive|подряд/.test(msg), msg);
+}
+
+// --- 16. Crowding ceiling — an over-confirmed setup is demoted to LOW ------
+{
+  // trend_continuation long with EVERY confirmation stacking: EMA agrees,
+  // dollar agrees, daily agrees, session fits, volatility fits, and a clean 2R.
+  // base 42 + 15 + 12 + 10 + 8 + 10 = 97 -> over the crowding ceiling.
+  const stacked = {
+    emaStack: 1, dollarDir: 1, dailyTrend: 1, session: 'london',
+    price: 2405, ema20: 2404,           // dist ≈ 0.17 ATR -> trend_continuation base 42
+    // No structural target is viable (all below entry), so levels fall back to a
+    // clean 2R and goodRR fires — pushing the score over 90.
+    priorDayHigh: 2400, swingHigh: 2404.5, sessionHigh: 2392,
+  };
+  const s = await runScorerDirect(stacked);
+  const sig = s.signal;
+  check('16a. the stacked setup actually scores >= 90', sig.score >= 90, `score=${sig.score} id=${sig.id}`);
+  check('16b. an over-confirmed setup is demoted to LOW', sig.conviction === 'LOW', `conviction=${sig.conviction} score=${sig.score}`);
+  check('16c. the downgrade is recorded in components', sig.components.crowdedCap === sig.score, JSON.stringify(sig.components));
+
+  // Same setup minus the dollar agreement: score 85, safely inside HIGH and NOT
+  // demoted — the ceiling must not fire early.
+  const belowCeiling = await runScorerDirect({ ...stacked, dollarDir: 0 });
+  check('16d. an 85-score setup stays HIGH (ceiling does not over-trigger)',
+    belowCeiling.signal.conviction === 'HIGH' && belowCeiling.signal.score < 90,
+    `conviction=${belowCeiling.signal.conviction} score=${belowCeiling.signal.score}`);
 }
 
 // ----------------------------------------------------------------- report ---

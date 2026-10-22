@@ -1,6 +1,10 @@
 # Unrelated ChatGPT images that happen to live in this folder
 ChatGPT Image*.png
 
+# Backtest data cache — raw Twelve Data pulls, regenerable, and large.
+# Kept out of git so history stays lean and no market data is redistributed.
+workflow/backtest/data/
+
 # OS / editor cruft
 Thumbs.db
 .DS_Store
