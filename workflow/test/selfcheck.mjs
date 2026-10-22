@@ -158,10 +158,10 @@ function makeSeries({
 const makePlan = (lang = 'en') => {
   const label = lang === 'ru' ? 'ЗОЛОТО' : 'GOLD';
   return [
-    { json: { role: 'asset', symbol: 'XAU/USD', interval: '15min', outputsize: 100, label, emoji: '\u{1F7E1}', lang } },
-    { json: { role: 'asset', symbol: 'XAU/USD', interval: '1h', outputsize: 200, label, emoji: '\u{1F7E1}', lang } },
-    { json: { role: 'asset', symbol: 'XAU/USD', interval: '1day', outputsize: 60, label, emoji: '\u{1F7E1}', lang } },
-    { json: { role: 'dollar_proxy', symbol: 'EUR/USD', interval: '1h', outputsize: 20, label: null, emoji: null, lang } },
+    { json: { role: 'asset', symbol: 'XAU/USD', interval: '15min', outputsize: 101, closedBars: 100, label, emoji: '\u{1F7E1}', lang } },
+    { json: { role: 'asset', symbol: 'XAU/USD', interval: '1h', outputsize: 201, closedBars: 200, label, emoji: '\u{1F7E1}', lang } },
+    { json: { role: 'asset', symbol: 'XAU/USD', interval: '1day', outputsize: 61, closedBars: 60, label, emoji: '\u{1F7E1}', lang } },
+    { json: { role: 'dollar_proxy', symbol: 'EUR/USD', interval: '1h', outputsize: 21, closedBars: 20, label: null, emoji: null, lang } },
   ];
 };
 
@@ -169,7 +169,8 @@ const PLAN = makePlan('en');
 
 /** A Wednesday 14:10 UTC (NY overlap), so breakout signals get session fit. */
 const NOW = Date.UTC(2026, 7, 19, 14, 10, 0);
-const LAST_15_CLOSE_MS = Date.UTC(2026, 7, 19, 14, 0, 0); // 10 min old, fresh
+const LAST_15_OPEN_MS = Date.UTC(2026, 7, 19, 13, 45, 0); // closed at 14:00, fresh
+const LAST_1H_OPEN_MS = Date.UTC(2026, 7, 19, 13, 0, 0); // closed at 14:00
 
 /**
  * All series are built to END at `basePrice`, so the 15m, 1h and daily views
@@ -197,13 +198,12 @@ function buildResponses({
     symbol: 'XAU/USD',
     interval: '1day',
     count: 60,
-    endMs: Date.UTC(2026, 7, 19),
+    endMs: Date.UTC(2026, 7, 18), // newest full UTC day
     startPrice: basePrice - 60,
     driftPerBar: 1.0,
     rangePerBar: 18,
     tailOverrides: {
-      1: { high: 2400, low: 2372, close: 2396 },                       // prior day
-      0: { high: basePrice + 4, low: basePrice - 18, close: basePrice }, // today, forming
+      0: { high: 2400, low: 2372, close: 2396 }, // prior completed day
     },
   });
 
@@ -227,7 +227,7 @@ function buildResponses({
     symbol: 'XAU/USD',
     interval: '15min',
     count: m15count,
-    endMs: LAST_15_CLOSE_MS,
+    endMs: LAST_15_OPEN_MS,
     startPrice: basePrice - (compress ? 0 : drift15 * (m15count - 1)),
     driftPerBar: compress ? 0 : drift15,
     rangePerBar: compress ? 0.4 : 5,
@@ -239,7 +239,7 @@ function buildResponses({
     symbol: 'XAU/USD',
     interval: '1h',
     count: h1count,
-    endMs: LAST_15_CLOSE_MS,
+    endMs: LAST_1H_OPEN_MS,
     startPrice: basePrice - drift1h * (h1count - 1), // ends at basePrice
     driftPerBar: drift1h,
     rangePerBar: compress ? 2 : 6,
@@ -249,7 +249,7 @@ function buildResponses({
     symbol: 'EUR/USD',
     interval: '1h',
     count: 20,
-    endMs: LAST_15_CLOSE_MS,
+    endMs: LAST_1H_OPEN_MS,
     startPrice: 1.085,
     driftPerBar: fxDrift,
     rangePerBar: 0.0008,

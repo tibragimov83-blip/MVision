@@ -2,7 +2,7 @@
  * NODE 6/6 — Log row
  * n8n Code node · Language: JavaScript · Mode: Run Once for All Items
  * ----------------------------------------------------------------------------
- * Sits between Format message and Log to Sheets, and emits ONLY the 16 columns
+ * Runs after Send to channel, and emits ONLY the 16 columns
  * the sheet is designed to hold.
  *
  * WHY THIS NODE EXISTS: the Google Sheets node's "Map Automatically" mode does
@@ -40,7 +40,9 @@ const COLUMNS = [
   'outcome_24h',
 ];
 
-const src = $input.first().json;
+// Telegram replaces the input JSON with its API response. Read the signal
+// explicitly so the successful delivery is logged with the original fields.
+const src = $('Format message').first().json;
 
 const row = {};
 for (const col of COLUMNS) {

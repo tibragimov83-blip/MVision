@@ -50,6 +50,8 @@ function fileFor(s) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function fetchSeries(s) {
+  // Start of the request is conservative if a candle closes while in flight.
+  const fetchedAt = new Date().toISOString();
   const url =
     `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(s.symbol)}` +
     `&interval=${encodeURIComponent(s.interval)}&outputsize=${OUTPUTSIZE}&timezone=UTC&apikey=${KEY}`;
@@ -58,7 +60,7 @@ async function fetchSeries(s) {
   if (body.status !== 'ok' || !Array.isArray(body.values)) {
     throw new Error(`${s.symbol} ${s.interval}: ${body.message || JSON.stringify(body).slice(0, 200)}`);
   }
-  return body;
+  return { ...body, _mvisionFetchedAt: fetchedAt };
 }
 
 async function main() {

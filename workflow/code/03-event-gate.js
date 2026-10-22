@@ -13,8 +13,8 @@
  * throw here kills the whole run and the channel goes silent. So a calendar
  * outage degrades instead of failing:
  *     fresh cache  -> use it
- *     stale cache  -> use it, flag staleness
- *     no cache     -> eventDataUnknown = true, scorer applies a precautionary
+ *     stale cache  -> use it for at most 24 hours, flag staleness
+ *     expired/no cache -> eventDataUnknown = true, scorer applies a precautionary
  *                     penalty rather than assuming the coast is clear
  *
  * KNOWN LIMITATION: the feed covers the current FF week (Sunday–Saturday).
@@ -24,6 +24,7 @@
 
 const CALENDAR_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
 const CACHE_TTL_MIN = 360;   // 6 hours -> ~4 fetches/day
+const MAX_CACHE_AGE_MIN = 24 * 60;
 const POST_EVENT_WINDOW = 15; // minutes after a print where price is still noise
 
 const ctx = $input.first().json;
@@ -34,7 +35,8 @@ const nowMs = Date.now();
 
 let events = Array.isArray(sd.calendarEvents) ? sd.calendarEvents : null;
 const fetchedAt = sd.calendarFetchedAt ? Date.parse(sd.calendarFetchedAt) : 0;
-const cacheAgeMin = fetchedAt ? (nowMs - fetchedAt) / 60000 : Infinity;
+const cacheAgeMin = Number.isFinite(fetchedAt) && fetchedAt > 0 && fetchedAt <= nowMs
+  ? (nowMs - fetchedAt) / 60000 : Infinity;
 
 let eventDataUnknown = false;
 let calendarStale = false;
@@ -71,7 +73,7 @@ if (!events || cacheAgeMin > CACHE_TTL_MIN) {
     console.log(`Calendar refreshed: ${events.length} high-impact USD events this week.`);
   } catch (err) {
     // Degrade, never die.
-    if (Array.isArray(sd.calendarEvents) && sd.calendarEvents.length > 0) {
+    if (Array.isArray(sd.calendarEvents) && cacheAgeMin <= MAX_CACHE_AGE_MIN) {
       events = sd.calendarEvents;
       calendarStale = true;
       calendarSource = 'stale_cache';
@@ -79,8 +81,9 @@ if (!events || cacheAgeMin > CACHE_TTL_MIN) {
     } else {
       events = [];
       eventDataUnknown = true;
+      calendarStale = Array.isArray(sd.calendarEvents);
       calendarSource = 'unavailable';
-      console.log(`Calendar fetch failed (${err.message}) and no cache exists; assuming event risk.`);
+      console.log(`Calendar fetch failed (${err.message}) and no usable cache exists; assuming event risk.`);
     }
   }
 }

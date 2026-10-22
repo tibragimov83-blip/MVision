@@ -1,0 +1,191 @@
+{
+  "name": "Gold signals + ATAS — daily futures context",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 22 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "tracker-schedule",
+      "name": "Daily trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -200,
+        300
+      ],
+      "notes": "22:30 UTC weekdays: after the 17:00 New York gold close and 15-minute feed delay, in either DST season."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const config = {\"channelId\":\"-1003977702706\",\"sheetDocumentId\":\"1AdbcG-_gpjtzoLZfKXeK8ZU8_XpVYQq1ce7AgQDRBgY\",\"sheetName\":\"signals_atas\",\"adapterUrl\":\"https://mvision-atas.tibragimov83.workers.dev\",\"errorWorkflowId\":\"gvC1exIlYQfsFXid\"};\nconst requireAdapter = true;\nconst originalChannel = \"-1004334466444\";\nconst originalSheet = 'signals';\n// The build supplies config, requireAdapter, and the original channel/sheet.\n// Public identifiers only: the adapter bearer belongs in an n8n credential.\nif (!/^\\-100\\d+$/.test(config.channelId) || config.channelId === originalChannel) {\n  throw new Error('Configure a different private ATAS channel ID before running.');\n}\nif (typeof config.sheetDocumentId !== 'string' || !/^[\\w-]+$/.test(config.sheetDocumentId) ||\n    typeof config.sheetName !== 'string' || !config.sheetName.trim() || config.sheetName === originalSheet) {\n  throw new Error('Configure a separate ATAS signals sheet tab before running.');\n}\nif (typeof config.errorWorkflowId !== 'string' || !config.errorWorkflowId.trim()) {\n  throw new Error('Configure the shared n8n error workflow ID before running.');\n}\nif (requireAdapter && (typeof config.adapterUrl !== 'string' ||\n    !/^https:\\/\\/[a-z0-9-]+(?:\\.[a-z0-9-]+)+(?:\\/[\\w/-]*)?\\/?$/i.test(config.adapterUrl))) {\n  throw new Error('Configure the deployed HTTPS ATAS adapter URL before running.');\n}\nreturn $input.all().map(item => ({ ...item, json: { ...item.json, adapterUrl: config.adapterUrl.replace(/\\/$/, '') } }));\n"
+      },
+      "id": "atas-check-config",
+      "name": "Check configuration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.adapterUrl + \"/summary\" }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 25000
+        }
+      },
+      "id": "atas-summary",
+      "name": "Fetch ATAS summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "stopWorkflow",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "ATAS adapter bearer"
+        }
+      },
+      "notes": "Header Auth name=Authorization, value=Bearer <ADAPTER_TOKEN>. Upstream failures stop and alert via the error workflow."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Daily GC futures context, deliberately separate from the XAU/USD scorer.\nconst data = $input.first().json;\nconst fail = () => { throw new Error('ATAS summary is incomplete, stale, or invalid; nothing was posted.'); };\nconst number = x => typeof x === 'number' && Number.isFinite(x);\nconst near = (a, b) => Math.abs(a - b) <= Math.max(0.01, Math.abs(b) * 1e-8);\nif (!data || data.schemaVersion !== 1 || data.source !== 'ATAS/dxFeed' || data.symbol !== '/GC:XCEC') fail();\nconst { session, summary: s, quality: q } = data;\nconst now = Date.now(), generated = Date.parse(data.generatedAt);\nif (!number(generated) || generated > now + 60000 || now - generated > 10 * 60000) fail();\nif (!session || !/^\\d{4}-\\d{2}-\\d{2}$/.test(session.date) || session.timeZone !== 'America/New_York') fail();\nconst start = Date.parse(session.start), end = Date.parse(session.end);\nif (!number(start) || !number(end) || end - start !== 23 * 3600000 ||\n    end + 15 * 60000 > now || now - end > 96 * 3600000) fail();\nconst parts = ms => Object.fromEntries(new Intl.DateTimeFormat('en-CA', {\n  timeZone: session.timeZone, year: 'numeric', month: '2-digit', day: '2-digit',\n  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',\n}).formatToParts(new Date(ms)).map(p => [p.type, p.value]));\nconst a = parts(start), b = parts(end);\nif (`${b.year}-${b.month}-${b.day}` !== session.date || a.hour !== '18' || b.hour !== '17' ||\n    a.minute !== '00' || b.minute !== '00' || a.second !== '00' || b.second !== '00' ||\n    [0, 6].includes(new Date(`${session.date}T12:00:00Z`).getUTCDay())) fail();\nif (!q || q.complete !== true || q.barCount !== 46 || !Number.isInteger(q.priceLevelCount) || q.priceLevelCount < 1 ||\n    !s || !['open', 'high', 'low', 'close', 'volume', 'poc', 'vah', 'val'].every(k => number(s[k]) && s[k] > 0) ||\n    s.valueAreaPercent !== 70 || s.low > Math.min(s.open, s.close, s.val) ||\n    s.high < Math.max(s.open, s.close, s.vah) || s.val > s.poc || s.poc > s.vah ||\n    !number(q.unclassifiedVolume) || q.unclassifiedVolume < 0 || q.unclassifiedVolume > s.volume) fail();\nif (s.delta !== null) {\n  if (!number(s.delta) || !number(s.bidVolume) || !number(s.askVolume) || s.bidVolume < 0 || s.askVolume < 0 ||\n      q.unclassifiedVolume !== 0 || !near(s.bidVolume + s.askVolume, s.volume) || !near(s.askVolume - s.bidVolume, s.delta)) fail();\n} else if (s.bidVolume !== null || s.askVolume !== null) fail();\n\nconst state = $getWorkflowStaticData('global');\nif (state.atasLastPostedSession && session.date <= state.atasLastPostedSession) return [];\nconst price = n => n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\nconst volume = n => Math.round(n).toLocaleString('en-US');\nconst sessionDate = session.date.split('-').reverse().join('.');\n// Keep emojis outside the monospace blocks: their width differs by client.\n// The compact frame fits mobile screens and mirrors the regular signal's pre.\nconst levelRows = [['VAH', s.vah], ['POC', s.poc], ['VAL', s.val]]\n  .map(([label, value]) => `${label.padEnd(5)}${price(value).padStart(10)}`);\nconst innerWidth = Math.max(19, ...levelRows.map(row => row.length + 2));\nconst levels = [\n  `┌${'─'.repeat(innerWidth)}┐`,\n  ...levelRows.map(row => `│ ${row.padEnd(innerWidth - 2)} │`),\n  `└${'─'.repeat(innerWidth)}┘`,\n].join('\\n').replace(/ /g, '\\u00a0');\nconst prices = [['Открытие', s.open], ['Максимум', s.high], ['Минимум', s.low], ['Закрытие', s.close]]\n  .map(([label, value]) => `${label.padEnd(10)}${price(value).padStart(10)}`).join('\\n').replace(/ /g, '\\u00a0');\nconst deltaIcon = s.delta === null || s.delta === 0 ? '⚪' : s.delta > 0 ? '🟢' : '🔴';\nconst deltaText = s.delta === null ? 'н/д · неполные данные Bid/Ask'\n  : `${s.delta > 0 ? '+' : ''}${volume(s.delta)} контрактов`;\nconst messageHtml = [\n  '🟨 <b>ЗОЛОТО · GC futures</b>',\n  '<b>ATAS · ДНЕВНОЙ ОБЪЁМНЫЙ КОНТЕКСТ</b>',\n  `📅 Завершённая сессия · <b>${sessionDate}</b>`,\n  '',\n  '🔷 <b>ПРОФИЛЬ ОБЪЁМА · 70%</b>',\n  `<pre>${levels}</pre>`,\n  '<i>VAH / VAL — границы зоны стоимости</i>',\n  '',\n  '📊 <b>ИТОГИ СЕССИИ</b>',\n  `Объём · <b>${volume(s.volume)}</b> контрактов`,\n  `<pre>${prices}</pre>`,\n  `${deltaIcon} Дельта Ask − Bid · <b>${deltaText}</b>`,\n  '',\n  '🕒 18:00–17:00 Нью-Йорк · задержка 15 мин',\n  '<i>ATAS/dxFeed · уровни фьючерса GC, не спот XAU/USD и не опционы.</i>',\n].join('\\n');\nreturn [{ json: { sessionDate: session.date, messageHtml }, pairedItem: { item: 0 } }];\n"
+      },
+      "id": "atas-format",
+      "name": "Format ATAS context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Validate a complete GC session and skip a session already posted.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "chatId": "-1003977702706",
+        "text": "={{ $json.messageHtml }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "appendAttribution": false
+        }
+      },
+      "id": "atas-send",
+      "name": "Send ATAS context",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        460,
+        300
+      ],
+      "notes": "Only the separate private channel. Automatic send retries are disabled to reduce duplicate delivery after uncertain responses.",
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram gold bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Static data is persisted only after a successful active workflow execution.\n// Telegram has already succeeded; its response replaces the original input.\nconst sessionDate = $('Format ATAS context').first().json.sessionDate;\n$getWorkflowStaticData('global').atasLastPostedSession = sessionDate;\nreturn [{ json: { sessionDate, posted: true }, pairedItem: { item: 0 } }];\n"
+      },
+      "id": "atas-mark-posted",
+      "name": "Mark session posted",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "notes": "Persist session date after a successful Telegram send.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Daily trigger": {
+      "main": [
+        [
+          {
+            "node": "Check configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check configuration": {
+      "main": [
+        [
+          {
+            "node": "Fetch ATAS summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch ATAS summary": {
+      "main": [
+        [
+          {
+            "node": "Format ATAS context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format ATAS context": {
+      "main": [
+        [
+          {
+            "node": "Send ATAS context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send ATAS context": {
+      "main": [
+        [
+          {
+            "node": "Mark session posted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "timezone": "UTC",
+    "errorWorkflow": "gvC1exIlYQfsFXid"
+  },
+  "pinData": {}
+}

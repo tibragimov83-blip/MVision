@@ -14,13 +14,15 @@
  *   - Responses are matched to the fetch plan by meta.symbol + meta.interval,
  *     not by item order. Order is not contractual.
  *
- * STALENESS GATE: if the newest 15m bar is older than 60 minutes the market is
- * shut (weekend, holiday, or the DST-straddling hour the cron over-covers).
- * We return [] which ends the run with no post. That is correct behaviour,
- * not a failure.
+ * CLOSED BARS: use open + interval <= now, including full UTC daily bars.
+ * STALENESS GATE: require fresh 15m, hourly and FX bars. Daily history allows
+ * weekends and one missing weekday for a market holiday. We return [] when
+ * coverage is stale, ending the run with no post.
  * ==========================================================================*/
 
-const MAX_BAR_AGE_MIN = 60;
+const DAY_MS = 86400000;
+const INTERVAL_MS = { '15min': 900000, '1h': 3600000, '1day': DAY_MS };
+const MAX_BAR_AGE_MIN = { '15min': 60, '1h': 180 };
 
 // ---------------------------------------------------------------- helpers ---
 
@@ -122,6 +124,7 @@ function sessionForHour(h) {
 
 const responses = $input.all();
 const plan = $('Build fetch plan').all().map((i) => i.json);
+const nowMs = Date.now();
 
 // Keyed "SYMBOL|interval" -> bars
 const series = {};
@@ -146,7 +149,11 @@ for (const item of responses) {
   if (bars.length === 0) {
     throw new Error(`Twelve Data returned no usable bars for ${sym} ${ivl}`);
   }
-  series[`${sym}|${ivl}`] = bars;
+  const cfg = plan.find((p) => p.symbol === sym && p.interval === ivl);
+  if (!INTERVAL_MS[ivl]) throw new Error(`Unsupported candle interval: ${ivl}`);
+  series[`${sym}|${ivl}`] = bars
+    .filter((b) => b.t + INTERVAL_MS[ivl] <= nowMs)
+    .slice(-(cfg?.closedBars || cfg?.outputsize || bars.length));
 }
 
 // Display metadata lives in the fetch plan so config stays in exactly one node.
@@ -164,22 +171,40 @@ const fx = dollarCfg ? series[`${dollarCfg.symbol}|${dollarCfg.interval}`] : nul
 for (const [name, arr] of [['15min', m15], ['1h', h1], ['1day', d1]]) {
   if (!arr) throw new Error(`Missing ${SYM} ${name} series in responses.`);
 }
+if (dollarCfg && !fx) throw new Error(`Missing ${dollarCfg.symbol} ${dollarCfg.interval} series in responses.`);
 
 // -------------------------------------------------------- staleness gate ----
 
-const nowMs = Date.now();
+for (const cfg of plan) {
+  const bars = series[`${cfg.symbol}|${cfg.interval}`];
+  if (!bars) throw new Error(`Missing ${cfg.symbol} ${cfg.interval} series in responses.`);
+  const newest = bars[bars.length - 1];
+  let stale = !newest;
+  if (newest && cfg.interval === '1day') {
+    // ponytail: one missing weekday permits holidays; an exchange calendar is
+    // needed only if multi-day weekday closures must remain tradable.
+    const today = Math.floor(nowMs / DAY_MS) * DAY_MS;
+    let missingWeekdays = 0;
+    for (let day = newest.t + DAY_MS; day < today; day += DAY_MS) {
+      const weekday = new Date(day).getUTCDay();
+      if (weekday !== 0 && weekday !== 6 && ++missingWeekdays > 1) {
+        stale = true;
+        break;
+      }
+    }
+  } else if (newest) {
+    stale = (nowMs - newest.t) / 60000 > MAX_BAR_AGE_MIN[cfg.interval];
+  }
+  if (stale) {
+    const sd = $getWorkflowStaticData('global');
+    sd.skipped = (sd.skipped || 0) + 1;
+    sd.lastSkipAt = new Date(nowMs).toISOString();
+    console.log(`Market closed or data stale: ${cfg.symbol} ${cfg.interval} lacks fresh closed bars. Skipping run.`);
+    return []; // ends the run, posts nothing
+  }
+}
 const newest15 = m15[m15.length - 1];
 const barAgeMin = (nowMs - newest15.t) / 60000;
-
-if (barAgeMin > MAX_BAR_AGE_MIN) {
-  const sd = $getWorkflowStaticData('global');
-  sd.skipped = (sd.skipped || 0) + 1;
-  sd.lastSkipAt = new Date(nowMs).toISOString();
-  console.log(
-    `Market closed or data stale: newest 15m bar is ${Math.round(barAgeMin)} min old. Skipping run.`,
-  );
-  return []; // ends the run, posts nothing
-}
 
 // ------------------------------------------------------------ indicators ----
 
@@ -196,14 +221,8 @@ if (!Number.isFinite(atr1h) || atr1h <= 0) {
   throw new Error('ATR(1h) could not be computed — insufficient 1h history.');
 }
 
-// Prior completed daily bar. values[0] after sorting is oldest, so the newest
-// daily bar is last — and it may be today's still-forming bar.
-const todayUTC = new Date(nowMs).toISOString().slice(0, 10);
-const newestDaily = d1[d1.length - 1];
-const priorDay =
-  newestDaily.datetime.slice(0, 10) === todayUTC && d1.length >= 2
-    ? d1[d1.length - 2]
-    : newestDaily;
+// Every daily input is complete, so the newest bar is the prior trading day.
+const priorDay = d1[d1.length - 1];
 
 // EMA stack: +1 aligned up, -1 aligned down, 0 mixed/unknown.
 let emaStack = 0;

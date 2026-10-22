@@ -1,0 +1,271 @@
+{
+  "name": "Gold signals + ATAS — outcome tracker",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "40 22 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "tracker-schedule",
+      "name": "Daily trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -200,
+        300
+      ],
+      "notes": "Daily. Scores yesterday's signals once their 24h window has closed."
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1AdbcG-_gpjtzoLZfKXeK8ZU8_XpVYQq1ce7AgQDRBgY"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "signals_atas"
+        },
+        "options": {}
+      },
+      "id": "sheets-read",
+      "name": "Read signals",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        20,
+        300
+      ],
+      "notes": "Reads all rows. Verify the operation shows as \"Read Rows\" after import.",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * TRACKER 1/2 — Select pending rows\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Task 0.2 (docs/ПЛАН-РАЗВИТИЯ.md): turn the signals log into a scorecard.\n *\n * Reads every row of the `signals` sheet and keeps only the ones that still\n * need an outcome: no outcome yet, a real directional signal (so it has a stop\n * and target), and old enough that its 24h window has fully closed. Emits them\n * as ONE item carrying a `pending` array — so the Fetch node downstream makes a\n * single Twelve Data call, not one per row.\n *\n * If nothing is pending it returns [], which ends the run before the API call.\n * On a quiet day this workflow therefore costs zero Twelve Data credits.\n * ==========================================================================*/\n\nconst MIN_AGE_MS = 24 * 60 * 60 * 1000; // 24h — the outcome window must be closed\n\nconst now = Date.now();\nconst rows = $input.all().map((i) => i.json);\n\nconst pending = [];\nfor (const r of rows) {\n  const scored = (r.outcome_24h ?? '').toString().trim();\n  if (scored) continue; // already has an outcome\n\n  const dir = (r.direction ?? '').toString().trim();\n  if (dir !== 'long' && dir !== 'short') continue; // NO_EDGE rows have no levels\n\n  const stop = parseFloat(r.stop);\n  const target = parseFloat(r.target);\n  if (!Number.isFinite(stop) || !Number.isFinite(target)) continue;\n\n  const startMs = Date.parse(r.ts_utc); // ts_utc is ISO (…Z) from the main workflow\n  if (!Number.isFinite(startMs)) continue;\n  if (now - startMs < MIN_AGE_MS) continue; // window not closed yet — score it tomorrow\n\n  pending.push({ ts_utc: r.ts_utc, direction: dir, stop, target, startMs });\n}\n\nif (pending.length === 0) return []; // nothing to do — no fetch, no API cost\n\nreturn [{ json: { pending, count: pending.length, checkedAt: new Date(now).toISOString() } }];\n"
+      },
+      "id": "tracker-select",
+      "name": "Select pending",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Keeps only directional rows with no outcome whose 24h window has closed. Empty -> run ends, no API call."
+    },
+    {
+      "parameters": {
+        "url": "https://api.twelvedata.com/time_series",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "XAU/USD"
+            },
+            {
+              "name": "interval",
+              "value": "15min"
+            },
+            {
+              "name": "outputsize",
+              "value": "500"
+            },
+            {
+              "name": "timezone",
+              "value": "UTC"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "http-td-tracker",
+      "name": "Fetch 15min",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "One call per run. Same Twelve Data query-auth credential as the main workflow.",
+      "credentials": {
+        "httpQueryAuth": {
+          "name": "Twelve Data apikey"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============================================================================\n * TRACKER 2/2 — Classify outcomes\n * n8n Code node · Language: JavaScript · Mode: Run Once for All Items\n * ----------------------------------------------------------------------------\n * Input: ONE Twelve Data 15min response (the single Fetch call).\n * Also reads the pending rows from the Select node by reference.\n *\n * For each pending row it walks the 15min bars inside [ts_utc, ts_utc+24h) and\n * asks the same question the backtest asks: did price reach the target or the\n * stop FIRST? Writes one of:\n *   target  — target hit first  (a win)\n *   stop    — stop hit first, or the bar spanned both (conservative)  (a loss)\n *   none    — neither within 24h\n *   no_data — uncovered entry or missing candles during expected market hours\n *   ambiguous — a partial boundary candle touched a level; intrabar time unknown\n *\n * The walk is shared with classifyOutcome in\n * workflow/backtest/replay.mjs, so live outcomes and backtest outcomes mean the\n * same thing and can be compared directly. tracker-selfcheck.mjs pins them to\n * the same fixtures.\n * ==========================================================================*/\n\nconst WINDOW_MS = 24 * 60 * 60 * 1000;\nconst BAR_MS = 15 * 60 * 1000; // API timestamps are candle OPEN times.\nconst GOLD_CLOCK = new Intl.DateTimeFormat('en-US', {\n  timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', hourCycle: 'h23',\n});\n\n// Normal gold closures only. Holidays or unexplained missing open-market bars\n// remain unscorable; a later candle cannot establish what happened in a hole.\nfunction closedGap(from, to) {\n  for (let t = from; t < to; t = Math.min(to, Math.floor(t / BAR_MS) * BAR_MS + BAR_MS)) {\n    const p = Object.fromEntries(GOLD_CLOCK.formatToParts(t).map(x => [x.type, x.value]));\n    const h = Number(p.hour);\n    if (!(p.weekday === 'Sat' || (p.weekday === 'Fri' && h >= 17) ||\n        (p.weekday === 'Sun' && h < 18) || (p.weekday !== 'Sun' && h === 17))) return false;\n  }\n  return true;\n}\n\nfunction parseBarTime(dt) {\n  if (!dt) return null;\n  const iso = dt.length <= 10 ? `${dt}T00:00:00Z` : `${dt.replace(' ', 'T')}Z`;\n  const ms = Date.parse(iso);\n  return Number.isFinite(ms) ? ms : null;\n}\n\n/** Oldest-first bars. Full candles touching both levels remain conservative. */\nfunction classify(direction, stop, target, bars) {\n  for (const b of bars) {\n    const hitStop = direction === 'long' ? b.low <= stop : b.high >= stop;\n    const hitTarget = direction === 'long' ? b.high >= target : b.low <= target;\n    if (b.partial && (hitStop || hitTarget)) return 'ambiguous';\n    if (hitStop && hitTarget) return 'stop';\n    if (hitTarget) return 'target';\n    if (hitStop) return 'stop';\n  }\n  return 'none';\n}\n\n/** Closed bars, oldest-first. Only complete observation windows can time out. */\nfunction classifyObservation(direction, stop, target, bars, startMs, endMs = startMs + WINDOW_MS) {\n  if (!bars.length) return 'pending';\n  if (startMs < bars[0].t) return 'no_data';\n  const windowBars = bars\n    .filter((b) => b.t < endMs && b.t + BAR_MS > startMs)\n    .map((b) => ({ ...b, partial: b.t < startMs || b.t + BAR_MS > endMs }));\n  let cursor = startMs;\n  for (const b of windowBars) {\n    if (b.t > cursor && !closedGap(cursor, b.t)) return 'no_data';\n    const outcome = classify(direction, stop, target, [b]);\n    if (outcome !== 'none') return outcome;\n    cursor = Math.max(cursor, b.t + BAR_MS);\n  }\n  if (cursor >= endMs || closedGap(cursor, endMs)) return 'none';\n  return bars[bars.length - 1].t + BAR_MS >= endMs ? 'no_data' : 'pending';\n}\n\n// --- n8n input (replay loads the pure functions above this marker) ---\nconst body = $input.first().json;\nif (!body || body.status !== 'ok' || !Array.isArray(body.values)) {\n  const detail = body && body.message ? body.message : JSON.stringify(body).slice(0, 200);\n  throw new Error(`Twelve Data fetch for outcome tracking failed: ${detail}`);\n}\n\nconst bars = body.values\n  .map((v) => ({ t: parseBarTime(v.datetime), high: parseFloat(v.high), low: parseFloat(v.low) }))\n  .filter((b) => b.t !== null && b.t + BAR_MS <= Date.now() && Number.isFinite(b.high) && Number.isFinite(b.low))\n  .sort((a, b) => a.t - b.t); // oldest-first\n\nconst pending = ($('Select pending').first().json.pending) || [];\n\nconst out = [];\nfor (const p of pending) {\n  const end = p.startMs + WINDOW_MS;\n\n  // No usable closed candles — can't score the row honestly.\n  if (bars.length === 0) {\n    out.push({ json: { ts_utc: p.ts_utc, outcome_24h: 'no_data' }, pairedItem: { item: 0 } });\n    continue;\n  }\n  const outcome = classifyObservation(p.direction, p.stop, p.target, bars, p.startMs, end);\n  // Window hasn't fully elapsed in the data yet — leave blank, retry tomorrow.\n  if (outcome === 'pending') continue;\n  out.push({ json: { ts_utc: p.ts_utc, outcome_24h: outcome }, pairedItem: { item: 0 } });\n}\n\nreturn out;\n"
+      },
+      "id": "tracker-classify",
+      "name": "Classify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "notes": "Walks each row's 24h window: target / stop / none / no_data / ambiguous. Same logic as the backtest."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1AdbcG-_gpjtzoLZfKXeK8ZU8_XpVYQq1ce7AgQDRBgY"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "signals_atas"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [
+            "ts_utc"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-update",
+      "name": "Update outcome",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        900,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "stopWorkflow",
+      "notes": "Update Row, matching on ts_utc. Verify the operation + matching column after import.",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const config = {\"channelId\":\"-1003977702706\",\"sheetDocumentId\":\"1AdbcG-_gpjtzoLZfKXeK8ZU8_XpVYQq1ce7AgQDRBgY\",\"sheetName\":\"signals_atas\",\"adapterUrl\":\"https://mvision-atas.tibragimov83.workers.dev\",\"errorWorkflowId\":\"gvC1exIlYQfsFXid\"};\nconst requireAdapter = false;\nconst originalChannel = \"-1004334466444\";\nconst originalSheet = 'signals';\n// The build supplies config, requireAdapter, and the original channel/sheet.\n// Public identifiers only: the adapter bearer belongs in an n8n credential.\nif (!/^\\-100\\d+$/.test(config.channelId) || config.channelId === originalChannel) {\n  throw new Error('Configure a different private ATAS channel ID before running.');\n}\nif (typeof config.sheetDocumentId !== 'string' || !/^[\\w-]+$/.test(config.sheetDocumentId) ||\n    typeof config.sheetName !== 'string' || !config.sheetName.trim() || config.sheetName === originalSheet) {\n  throw new Error('Configure a separate ATAS signals sheet tab before running.');\n}\nif (typeof config.errorWorkflowId !== 'string' || !config.errorWorkflowId.trim()) {\n  throw new Error('Configure the shared n8n error workflow ID before running.');\n}\nif (requireAdapter && (typeof config.adapterUrl !== 'string' ||\n    !/^https:\\/\\/[a-z0-9-]+(?:\\.[a-z0-9-]+)+(?:\\/[\\w/-]*)?\\/?$/i.test(config.adapterUrl))) {\n  throw new Error('Configure the deployed HTTPS ATAS adapter URL before running.');\n}\nreturn $input.all().map(item => ({ ...item, json: { ...item.json, adapterUrl: config.adapterUrl.replace(/\\/$/, '') } }));\n"
+      },
+      "id": "atas-check-config",
+      "name": "Check configuration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Daily trigger": {
+      "main": [
+        [
+          {
+            "node": "Check configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read signals": {
+      "main": [
+        [
+          {
+            "node": "Select pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select pending": {
+      "main": [
+        [
+          {
+            "node": "Fetch 15min",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch 15min": {
+      "main": [
+        [
+          {
+            "node": "Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify": {
+      "main": [
+        [
+          {
+            "node": "Update outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check configuration": {
+      "main": [
+        [
+          {
+            "node": "Read signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "timezone": "UTC",
+    "errorWorkflow": "gvC1exIlYQfsFXid"
+  },
+  "pinData": {},
+  "active": false
+}

@@ -225,12 +225,12 @@ const mainNodes = [
 
   {
     parameters: {
-      operation: 'append',
+      operation: 'appendOrUpdate',
       documentId: { __rl: true, mode: 'id', value: GOOGLE_SHEET_ID },
       sheetName: { __rl: true, mode: 'name', value: 'signals' },
       columns: {
         mappingMode: 'autoMapInputData',
-        matchingColumns: [],
+        matchingColumns: ['ts_utc'],
         schema: [],
       },
       options: {},
@@ -240,10 +240,13 @@ const mainNodes = [
     type: 'n8n-nodes-base.googleSheets',
     typeVersion: 4.5,
     position: [1780, 400],
-    // Logging must never block the post.
-    onError: 'continueRegularOutput',
+    // Delivery already succeeded. Retry logging, then surface the failure.
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 3000,
+    onError: 'stopWorkflow',
     notes:
-      'autoMapInputData matches the 16 header columns by name; extra fields (messageHtml, _diagnostics) are ignored.',
+      'Upsert by ts_utc makes write retries safe after an uncertain response. Log row supplies only the 16 header columns.',
     credentials: {
       googleSheetsOAuth2Api: { name: 'Google Sheets account' },
     },
@@ -262,10 +265,10 @@ const mainConnections = {
     main: [
       [
         { node: 'Send to channel', type: 'main', index: 0 },
-        { node: 'Log row', type: 'main', index: 0 },
       ],
     ],
   },
+  'Send to channel': { main: [[{ node: 'Log row', type: 'main', index: 0 }]] },
   'Log row': { main: [[{ node: 'Log to Sheets', type: 'main', index: 0 }]] },
   // Sub-node attaches on the ai_languageModel port, not main.
   'Anthropic Chat Model': {
@@ -304,7 +307,7 @@ const errorNodes = [
     parameters: {
       chatId: TELEGRAM_OWNER_ID,
       text: [
-        '=\u{1F534} <b>Gold signal bot failed</b>',
+        '=\u{1F534} Gold signal bot failed',
         '',
         'Workflow: {{ $json.workflow.name }}',
         'Node: {{ $json.execution.lastNodeExecuted }}',
@@ -313,7 +316,6 @@ const errorNodes = [
         '{{ $json.execution.url }}',
       ].join('\n'),
       additionalFields: {
-        parse_mode: 'HTML',
         appendAttribution: false,
       },
     },
@@ -420,7 +422,7 @@ const trackerNodes = [
     type: 'n8n-nodes-base.code',
     typeVersion: 2,
     position: [680, 300],
-    notes: 'Walks each row\'s 24h window: target / stop / none / no_data. Same logic as the backtest.',
+    notes: 'Walks each row\'s 24h window: target / stop / none / no_data / ambiguous. Same logic as the backtest.',
   },
   {
     parameters: {
@@ -440,8 +442,11 @@ const trackerNodes = [
     type: 'n8n-nodes-base.googleSheets',
     typeVersion: 4.5,
     position: [900, 300],
-    // A failed write must not wedge the run; the row stays pending and retries.
-    onError: 'continueRegularOutput',
+    // A failed write remains pending and must also reach the error workflow.
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 3000,
+    onError: 'stopWorkflow',
     notes: 'Update Row, matching on ts_utc. Verify the operation + matching column after import.',
     credentials: { googleSheetsOAuth2Api: { name: 'Google Sheets account' } },
   },
@@ -469,6 +474,90 @@ const trackerWorkflow = {
   pinData: {},
 };
 
+// ------------------------------------------------------- separate ATAS flows
+// Public configuration is checked before the first network call. Bearer tokens
+// are stored only in the named n8n Header Auth credential, never this export.
+const atasConfig = JSON.parse(fs.readFileSync(path.join(HERE, 'atas-config.json'), 'utf8'));
+const atasSettings = {
+  ...mainWorkflow.settings,
+  ...(atasConfig.errorWorkflowId ? { errorWorkflow: atasConfig.errorWorkflowId } : {}),
+};
+const checkConfiguration = (requireAdapter = false) => ({
+  parameters: {
+    mode: 'runOnceForAllItems',
+    jsCode: `const config = ${JSON.stringify(atasConfig)};\nconst requireAdapter = ${requireAdapter};\n` +
+      `const originalChannel = ${JSON.stringify(TELEGRAM_CHANNEL_ID)};\nconst originalSheet = 'signals';\n` + js('atas-check-config.js'),
+  },
+  id: 'atas-check-config', name: 'Check configuration', type: 'n8n-nodes-base.code',
+  typeVersion: 2, position: [-400, 300],
+});
+function separateWorkflow(base, name) {
+  const flow = structuredClone(base);
+  flow.name = name;
+  flow.active = false;
+  flow.settings = { ...atasSettings };
+  for (const n of flow.nodes) {
+    if (n.type === 'n8n-nodes-base.telegram') n.parameters.chatId = atasConfig.channelId;
+    if (n.type === 'n8n-nodes-base.googleSheets') {
+      n.parameters.documentId.value = atasConfig.sheetDocumentId;
+      n.parameters.sheetName.value = atasConfig.sheetName;
+    }
+  }
+  const trigger = flow.nodes.find(n => n.type === 'n8n-nodes-base.scheduleTrigger');
+  const downstream = flow.connections[trigger.name];
+  flow.connections[trigger.name] = { main: [[{ node: 'Check configuration', type: 'main', index: 0 }]] };
+  flow.connections['Check configuration'] = downstream;
+  flow.nodes.push(checkConfiguration());
+  return flow;
+}
+const atasMain = separateWorkflow(mainWorkflow, 'Gold signals — XAU/USD 30min + ATAS');
+const atasTracker = separateWorkflow(trackerWorkflow, 'Gold signals + ATAS — outcome tracker');
+// Both channels share a free Twelve Data credential. Stagger the new calls so
+// the original main/tracker and their retries have room within the rate limit.
+atasMain.nodes.find(n => n.type === 'n8n-nodes-base.scheduleTrigger').parameters.rule.interval
+  .forEach(rule => { rule.expression = rule.expression.replace('*/30', '2,32'); });
+atasTracker.nodes.find(n => n.type === 'n8n-nodes-base.scheduleTrigger').parameters.rule.interval[0].expression = '40 22 * * 1-5';
+const dailyTrigger = structuredClone(trackerNodes[0]);
+dailyTrigger.notes = '22:30 UTC weekdays: after the 17:00 New York gold close and 15-minute feed delay, in either DST season.';
+const atasDaily = {
+  name: 'Gold signals + ATAS — daily futures context', active: false,
+  nodes: [
+    dailyTrigger,
+    checkConfiguration(true),
+    {
+      parameters: {
+        url: '={{ $json.adapterUrl + "/summary" }}',
+        authentication: 'genericCredentialType', genericAuthType: 'httpHeaderAuth',
+        options: { timeout: 25000 },
+      },
+      id: 'atas-summary', name: 'Fetch ATAS summary', type: 'n8n-nodes-base.httpRequest',
+      typeVersion: 4.2, position: [20, 300], retryOnFail: true, maxTries: 2,
+      waitBetweenTries: 3000, onError: 'stopWorkflow',
+      credentials: { httpHeaderAuth: { name: 'ATAS adapter bearer' } },
+      notes: 'Header Auth name=Authorization, value=Bearer <ADAPTER_TOKEN>. Upstream failures stop and alert via the error workflow.',
+    },
+    { ...codeNode('Format ATAS context', 'atas-format.js', 240, 300, 'Validate a complete GC session and skip a session already posted.'), id: 'atas-format' },
+    {
+      ...structuredClone(mainNodes.find(n => n.name === 'Send to channel')),
+      id: 'atas-send', name: 'Send ATAS context', position: [460, 300],
+      parameters: {
+        chatId: atasConfig.channelId, text: '={{ $json.messageHtml }}',
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+      },
+      notes: 'Only the separate private channel. Automatic send retries are disabled to reduce duplicate delivery after uncertain responses.',
+    },
+    { ...codeNode('Mark session posted', 'atas-mark-posted.js', 680, 300, 'Persist session date after a successful Telegram send.'), id: 'atas-mark-posted' },
+  ],
+  connections: {
+    'Daily trigger': { main: [[{ node: 'Check configuration', type: 'main', index: 0 }]] },
+    'Check configuration': { main: [[{ node: 'Fetch ATAS summary', type: 'main', index: 0 }]] },
+    'Fetch ATAS summary': { main: [[{ node: 'Format ATAS context', type: 'main', index: 0 }]] },
+    'Format ATAS context': { main: [[{ node: 'Send ATAS context', type: 'main', index: 0 }]] },
+    'Send ATAS context': { main: [[{ node: 'Mark session posted', type: 'main', index: 0 }]] },
+  },
+  settings: { ...atasSettings }, pinData: {},
+};
+
 // ----------------------------------------------------------------- write ----
 
 const out = (name, obj) => {
@@ -482,6 +571,9 @@ console.log('Building workflow JSON from code/ sources:');
 out('gold-signals-main.json', mainWorkflow);
 out('gold-signals-error.json', errorWorkflow);
 out('gold-signals-tracker.json', trackerWorkflow);
+out('gold-signals-atas-main.json', atasMain);
+out('gold-signals-atas-tracker.json', atasTracker);
+out('gold-signals-atas-daily.json', atasDaily);
 
 // Also emit the prompt as plain text. The Write prose node's Text field is the
 // one thing you cannot update by pasting a code/*.js file, so this makes it
@@ -522,6 +614,8 @@ function validate(nodes, connections, label) {
 
 const problems =
   validate(mainNodes, mainConnections, 'main') +
-  validate(trackerNodes, trackerConnections, 'tracker');
+  validate(trackerNodes, trackerConnections, 'tracker') +
+  validate(errorNodes, errorWorkflow.connections, 'error') +
+  [atasMain, atasTracker, atasDaily].reduce((sum, flow) => sum + validate(flow.nodes, flow.connections, flow.name), 0);
 console.log(problems === 0 ? 'Structure OK.' : `${problems} structural problem(s).`);
 if (problems > 0) process.exit(1);

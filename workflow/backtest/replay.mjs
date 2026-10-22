@@ -3,12 +3,12 @@
  * ----------------------------------------------------------------------------
  *   node workflow/backtest/replay.mjs            # run the backtest
  *   node workflow/backtest/replay.mjs --selfcheck # test the outcome classifier
- *   node workflow/backtest/replay.mjs --hold 96   # max hold in 15min bars (def 192 = 48h)
+ *   node workflow/backtest/replay.mjs --hold 96   # 96 × 15min elapsed (default = 24h)
  *
  * Steps every 30 minutes across the cached history. At each decision time T it
  * builds "as-of-T" Twelve Data responses (only bars CLOSED by T — no
  * look-ahead), runs the REAL 02-indicators and 04-scorer node sources, and if a
- * directional signal fires, walks the 15min bars AFTER T to see whether target
+ * directional signal fires, walks the 15min bars in [T,T+24h) to see whether target
  * or stop was hit first. Aggregates win-rate and expectancy per generator.
  *
  * It runs the exact code that posts to the channel — same files, same harness
@@ -21,7 +21,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CODE = path.join(HERE, '..', 'code');
@@ -80,7 +80,8 @@ function loadSeries() {
     }
     const body = JSON.parse(fs.readFileSync(p, 'utf8'));
     // Attach parsed open-time, keep everything else verbatim (string OHLC etc).
-    const withT = body.values.map((v) => ({ ...v, _t: parseBarTime(v.datetime) }));
+    const withT = closedCacheValues(body, IV[body.meta.interval])
+      .map((v) => ({ ...v, _t: parseBarTime(v.datetime) }));
     withT.sort((a, b) => b._t - a._t); // newest-first, as the API delivers
     return { meta: body.meta, values: withT };
   };
@@ -106,6 +107,16 @@ function asOf(series, intervalMs, T, size) {
 const MIN = 60000;
 const IV = { '15min': 15 * MIN, '1h': 60 * MIN, '1day': 24 * 60 * MIN };
 
+// A frozen forming tail never becomes a closed historical candle just because
+// replay runs later. Legacy caches lack capture metadata, so drop their newest
+// candle conservatively; refetch to certify it instead of trusting file mtime.
+export function closedCacheValues(body, intervalMs) {
+  const captured = Date.parse(body._mvisionFetchedAt);
+  const newestOpen = Math.max(...body.values.map(v => parseBarTime(v.datetime)));
+  const cutoff = Number.isFinite(captured) ? Math.min(captured, Date.now()) : newestOpen;
+  return body.values.filter(v => parseBarTime(v.datetime) + intervalMs <= cutoff);
+}
+
 // Clear gate: a real event far away, no penalty, no unknown-data penalty.
 const GATE_CLEAR = {
   minutesToNext: 5000,
@@ -123,21 +134,17 @@ const GATE_CLEAR = {
 
 // ------------------------------------------------------- outcome classifier ---
 
-/**
- * Did price hit target or stop first, walking future bars in order?
- * futureBars: oldest-first {high, low}. Returns 'win' | 'loss' | 'timeout'.
- * If a single bar spans both levels the result is ambiguous intra-bar, so it is
- * counted as a loss — the conservative assumption for a risk-first system.
- */
-function classifyOutcome(direction, stop, target, futureBars) {
-  for (const b of futureBars) {
-    const hitStop = direction === 'long' ? b.low <= stop : b.high >= stop;
-    const hitTarget = direction === 'long' ? b.high >= target : b.low <= target;
-    if (hitStop && hitTarget) return 'loss'; // ambiguous -> conservative
-    if (hitTarget) return 'win';
-    if (hitStop) return 'loss';
-  }
-  return 'timeout';
+// Reuse the tracker's pure functions; deployed n8n code stays self-contained.
+const trackerSource = fs.readFileSync(path.join(CODE, 'tracker-02-classify.js'), 'utf8')
+  .split('// --- n8n input')[0];
+const { classify, classifyObservation } = new Function(`${trackerSource}\nreturn { classify, classifyObservation };`)();
+
+/** Timed bars use elapsed windows; untimed bars support the small walk selfcheck. */
+export function classifyOutcome(direction, stop, target, bars, startMs, holdMs = 24 * 60 * 60 * 1000) {
+  const outcome = Number.isFinite(startMs)
+    ? classifyObservation(direction, stop, target, bars, startMs, startMs + holdMs)
+    : classify(direction, stop, target, bars);
+  return { target: 'win', stop: 'loss', none: 'timeout' }[outcome] ?? outcome;
 }
 
 // ------------------------------------------------------------- aggregation ---
@@ -170,6 +177,7 @@ function fmtRow(label, a) {
 // ------------------------------------------------------------------ replay ---
 
 async function replay(maxHold) {
+  const holdMs = maxHold * IV['15min'];
   const { g15, g1h, g1d, fx1h } = loadSeries();
 
   // Oldest-first 15min bars drive both the step cadence and the outcome walk.
@@ -194,7 +202,7 @@ async function replay(maxHold) {
   const overall = newAgg();
   const newOnly = newAgg();
 
-  let steps = 0, signals = 0, skipped = 0, errors = 0;
+  let steps = 0, signals = 0, skipped = 0, errors = 0, pending = 0, ambiguous = 0, noData = 0;
   let prevKey = null;
 
   // Start once 100 15min bars exist behind us; step every 2 bars ≈ 30 min.
@@ -238,10 +246,11 @@ async function replay(maxHold) {
     const sig = scoreOut[0].json.signal;
     if (!sig || sig.direction === 'none' || sig.stop === null || sig.target === null) continue;
 
-    // Outcome: walk bars strictly after T (never the signal bar itself).
-    const future = numeric15.filter((b) => b.t >= T).slice(0, maxHold);
-    if (future.length === 0) continue; // ran off the end of history
-    const outcome = classifyOutcome(sig.direction, sig.stop, sig.target, future);
+    // Timestamp bounds preserve elapsed hours across weekends and closures.
+    const outcome = classifyOutcome(sig.direction, sig.stop, sig.target, numeric15, T, holdMs);
+    if (outcome === 'pending') { pending++; continue; }
+    if (outcome === 'ambiguous') { ambiguous++; continue; }
+    if (outcome === 'no_data') { noData++; continue; }
 
     signals++;
     const key = `${sig.id}|${sig.direction}`;
@@ -260,8 +269,9 @@ async function replay(maxHold) {
   const first = new Date(numeric15[START].t).toISOString().slice(0, 10);
   const last = new Date(numeric15[numeric15.length - 1].t).toISOString().slice(0, 10);
 
-  console.log(`\nBacktest XAU/USD  ${first} → ${last}  (maxHold ${maxHold} bars = ${maxHold / 4}h)`);
+  console.log(`\nBacktest XAU/USD  ${first} → ${last}  (maxHold ${maxHold / 4} elapsed hours)`);
   console.log(`steps ${steps} · signals ${signals} · market-closed skips ${skipped} · errors ${errors}\n`);
+  console.log(`Unscored observations: pending ${pending} · ambiguous ${ambiguous} · no_data ${noData}\n`);
 
   const head = 'setup'.padEnd(26) + 'n'.padStart(5) + 'win'.padStart(6) + 'loss'.padStart(6) +
     'timeout'.padStart(8) + 'win%'.padStart(7) + 'avgR'.padStart(8);
@@ -323,11 +333,14 @@ function selfcheck() {
 
 // ------------------------------------------------------------------- main ---
 
-const args = process.argv.slice(2);
-if (args.includes('--selfcheck')) {
-  selfcheck();
-} else {
-  const hi = args.indexOf('--hold');
-  const maxHold = hi >= 0 ? parseInt(args[hi + 1], 10) : 192;
-  replay(maxHold).catch((e) => { console.error(e); process.exit(1); });
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  const args = process.argv.slice(2);
+  if (args.includes('--selfcheck')) {
+    selfcheck();
+  } else {
+    const hi = args.indexOf('--hold');
+    const maxHold = hi >= 0 ? Number(args[hi + 1]) : 96;
+    if (!Number.isInteger(maxHold) || maxHold <= 0) throw new Error('--hold must be a positive number of 15-minute intervals');
+    replay(maxHold).catch((e) => { console.error(e); process.exit(1); });
+  }
 }

@@ -15,9 +15,8 @@
     {
       "parameters": {
         "chatId": "7979212963",
-        "text": "=🔴 <b>Gold signal bot failed</b>\n\nWorkflow: {{ $json.workflow.name }}\nNode: {{ $json.execution.lastNodeExecuted }}\nError: {{ $json.execution.error.message }}\n\n{{ $json.execution.url }}",
+        "text": "=🔴 Gold signal bot failed\n\nWorkflow: {{ $json.workflow.name }}\nNode: {{ $json.execution.lastNodeExecuted }}\nError: {{ $json.execution.error.message }}\n\n{{ $json.execution.url }}",
         "additionalFields": {
-          "parse_mode": "HTML",
           "appendAttribution": false
         }
       },

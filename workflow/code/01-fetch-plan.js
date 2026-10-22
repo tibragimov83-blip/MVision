@@ -68,7 +68,8 @@ for (const asset of ASSETS) {
         role: 'asset',
         symbol: asset.symbol,
         interval: s.interval,
-        outputsize: s.outputsize,
+        outputsize: s.outputsize + 1, // room for the API's current forming bar
+        closedBars: s.outputsize,
         // Resolve the display name for the active language, falling back to the
         // raw value so a plain string still works if someone edits ASSETS.
         label:
@@ -91,7 +92,8 @@ for (const c of CONTEXT) {
       role: c.role,
       symbol: c.symbol,
       interval: c.interval,
-      outputsize: c.outputsize,
+      outputsize: c.outputsize + 1,
+      closedBars: c.outputsize,
       label: null,
       emoji: null,
       lang: LANG,
